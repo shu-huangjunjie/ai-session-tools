@@ -1,0 +1,13 @@
+# Link the C runtime statically so the exe runs on computers without the
+# Visual C++ Redistributable (otherwise VCRUNTIME140.dll is required).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# MinGW toolchains: link the unwinder statically (otherwise libunwind.dll or
+# libgcc_s_seh-1.dll is required). WebView2Loader.dll is still loaded at run time;
+# build.ps1 copies it next to the exe.
+[target.x86_64-pc-windows-gnullvm]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]

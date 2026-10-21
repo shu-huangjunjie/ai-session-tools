@@ -1,0 +1,300 @@
+import React, { useState, useMemo } from 'react';
+import {
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  Folder,
+  RefreshCw,
+  Search,
+} from 'lucide-react';
+import { ClaudeCandidate, ClaudeRecoveryReport } from '../types';
+import { extractProjectName, formatDateTime } from '../utils/formatters';
+import { Button } from './common/Button';
+import { Modal } from './common/Modal';
+import { useI18n } from '../i18n';
+
+interface ClaudeRecoveryModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  report: ClaudeRecoveryReport | null;
+  onConfirmRecovery: (candidates: ClaudeCandidate[]) => Promise<void>;
+  isRecovering: boolean;
+}
+
+export const ClaudeRecoveryModal: React.FC<ClaudeRecoveryModalProps> = ({
+  isOpen,
+  onClose,
+  report,
+  onConfirmRecovery,
+  isRecovering,
+}) => {
+  const { t, interpolate } = useI18n();
+  const [filterText, setFilterText] = useState('');
+  const [hideExisting, setHideExisting] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(new Set());
+
+  // Initialize selection when report arrives (defaults to selecting candidates not yet imported)
+  React.useEffect(() => {
+    if (report) {
+      const initial = new Set(
+        report.candidates.filter((c) => !c.exists_locally).map((c) => c.session_id)
+      );
+      setSelectedIds(initial);
+    }
+  }, [report]);
+
+  const filteredCandidates = useMemo(() => {
+    if (!report) return [];
+    let list = report.candidates;
+    if (hideExisting) {
+      list = list.filter((c) => !c.exists_locally);
+    }
+    const q = filterText.trim().toLowerCase();
+    if (q) {
+      list = list.filter(
+        (c) =>
+          c.title.toLowerCase().includes(q) ||
+          c.preview.toLowerCase().includes(q) ||
+          (c.project_path && c.project_path.toLowerCase().includes(q))
+      );
+    }
+    return list;
+  }, [report, hideExisting, filterText]);
+
+  // Group by project
+  const grouped = useMemo(() => {
+    const uncategorized = t.common.uncategorized;
+    const map = new Map<string, ClaudeCandidate[]>();
+    for (const c of filteredCandidates) {
+      const key = c.project_path || uncategorized;
+      const list = map.get(key) || [];
+      list.push(c);
+      map.set(key, list);
+    }
+    return Array.from(map.entries()).sort((a, b) => {
+      if (a[0] === uncategorized) return 1;
+      if (b[0] === uncategorized) return -1;
+      return a[0].localeCompare(b[0]);
+    });
+  }, [filteredCandidates, t.common.uncategorized]);
+
+  const toggleSelect = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleGroup = (candidates: ClaudeCandidate[]) => {
+    const ids = candidates.map((c) => c.session_id);
+    const allChecked = ids.every((id) => selectedIds.has(id));
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allChecked) {
+        ids.forEach((id) => next.delete(id));
+      } else {
+        ids.forEach((id) => next.add(id));
+      }
+      return next;
+    });
+  };
+
+  const selectAll = () => {
+    setSelectedIds(new Set(filteredCandidates.map((c) => c.session_id)));
+  };
+
+  const selectNone = () => {
+    setSelectedIds(new Set());
+  };
+
+  const handleConfirm = async () => {
+    if (!report) return;
+    const selectedList = report.candidates.filter((c) => selectedIds.has(c.session_id));
+    await onConfirmRecovery(selectedList);
+  };
+
+  if (!isOpen || !report) return null;
+
+  return (
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      title={t.modals.claudeRecoveryTitle}
+      subtitle={interpolate(t.modals.claudeRecoverySubtitle, {
+        count: report.candidates.length,
+        dir: report.claude_home,
+      })}
+      widthClass="max-w-3xl"
+    >
+      <div className="flex flex-col gap-4 text-xs">
+        {/* Filters and Toolbar */}
+        <div className="flex items-center justify-between gap-3 bg-black/[0.02] dark:bg-white/[0.03] p-2.5 rounded-2xl border border-black/[0.06] dark:border-white/[0.08]">
+          <div className="relative flex-1">
+            <Search className="absolute left-3 top-2.5 text-[#86868b]" size={13} />
+            <input
+              type="text"
+              value={filterText}
+              onChange={(e) => setFilterText(e.target.value)}
+              placeholder={t.modals.filterPlaceholder}
+              className="w-full bg-black/[0.04] dark:bg-white/[0.06] text-[#1d1d1f] dark:text-[#ededf0] text-xs pl-8 pr-3 py-1.5 rounded-full border border-black/[0.08] dark:border-white/[0.1] focus:border-[#0071e3] focus:outline-none placeholder-[#86868b]"
+            />
+          </div>
+
+          <label className="flex items-center gap-2 cursor-pointer text-[#6e6e73] dark:text-[#86868b] hover:text-[#1d1d1f] dark:hover:text-[#ededf0] select-none text-[11px] transition-colors">
+            <input
+              type="checkbox"
+              checked={hideExisting}
+              onChange={(e) => setHideExisting(e.target.checked)}
+              className="rounded bg-black/[0.05] dark:bg-white/[0.08] border-black/20 dark:border-white/20 text-[#0071e3] w-3.5 h-3.5 cursor-pointer accent-[#0071e3]"
+            />
+            {t.modals.hideExisting}
+          </label>
+
+          <div className="flex items-center gap-1.5">
+            <Button variant="ghost" size="sm" onClick={selectAll}>
+              {t.modals.selectAll}
+            </Button>
+            <Button variant="ghost" size="sm" onClick={selectNone}>
+              {t.modals.clearAll}
+            </Button>
+          </div>
+        </div>
+
+        {/* Tree List */}
+        <div className="max-h-[380px] overflow-y-auto border border-black/[0.08] dark:border-white/[0.08] rounded-2xl bg-black/[0.01] dark:bg-white/[0.02] p-2 space-y-2">
+          {grouped.length === 0 ? (
+            <div className="text-center py-12 text-[#86868b]">
+              {t.modals.noCandidates}
+            </div>
+          ) : (
+            grouped.map(([projectPath, items]) => {
+              const projectName = extractProjectName(projectPath);
+              const isCollapsed = collapsedProjects.has(projectPath);
+              const allChecked = items.every((c) => selectedIds.has(c.session_id));
+              const someChecked = items.some((c) => selectedIds.has(c.session_id)) && !allChecked;
+
+              return (
+                <div
+                  key={projectPath}
+                  className="rounded-xl border border-black/[0.06] dark:border-white/[0.06] overflow-hidden bg-black/[0.01] dark:bg-white/[0.02]"
+                >
+                  {/* Group Header */}
+                  <div className="flex items-center justify-between px-3 py-2 bg-black/[0.03] dark:bg-white/[0.04] border-b border-black/[0.04] dark:border-white/[0.04] text-xs">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={allChecked}
+                        ref={(el) => {
+                          if (el) el.indeterminate = someChecked;
+                        }}
+                        onChange={() => toggleGroup(items)}
+                        className="rounded bg-black/[0.05] dark:bg-white/[0.08] border-black/20 dark:border-white/20 text-[#0071e3] w-3.5 h-3.5 cursor-pointer accent-[#0071e3]"
+                      />
+                      <button
+                        onClick={() => {
+                          setCollapsedProjects((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(projectPath)) next.delete(projectPath);
+                            else next.add(projectPath);
+                            return next;
+                          });
+                        }}
+                        className="flex items-center gap-1.5 font-semibold text-[#1d1d1f] dark:text-[#f5f5f7]"
+                      >
+                        {isCollapsed ? (
+                          <ChevronRight size={13} className="text-[#86868b]" />
+                        ) : (
+                          <ChevronDown size={13} className="text-[#6e6e73] dark:text-[#a1a1a6]" />
+                        )}
+                        <Folder size={13} className="text-[#2997ff]" />
+                        <span>{projectName}</span>
+                      </button>
+                    </div>
+
+                    <span className="text-[10px] text-[#6e6e73] dark:text-[#86868b] bg-black/[0.04] dark:bg-white/[0.06] px-2 py-0.5 rounded-full font-medium">
+                      {items.length} {t.common.conversations}
+                    </span>
+                  </div>
+
+                  {/* Group Items */}
+                  {!isCollapsed && (
+                    <div className="divide-y divide-black/[0.04] dark:divide-white/[0.04]">
+                      {items.map((cand) => {
+                        const isChecked = selectedIds.has(cand.session_id);
+
+                        return (
+                          <div
+                            key={cand.session_id}
+                            onClick={() => toggleSelect(cand.session_id)}
+                            className="flex items-center justify-between px-3.5 py-2 hover:bg-black/[0.03] dark:hover:bg-white/[0.04] cursor-pointer transition-colors"
+                          >
+                            <div className="flex items-center gap-2 min-w-0 flex-1">
+                              <input
+                                type="checkbox"
+                                checked={isChecked}
+                                onChange={() => {}}
+                                className="rounded bg-black/[0.05] dark:bg-white/[0.08] border-black/20 dark:border-white/20 text-[#0071e3] w-3.5 h-3.5 flex-shrink-0 cursor-pointer accent-[#0071e3]"
+                              />
+                              <span
+                                className="font-medium text-[#1d1d1f] dark:text-[#ededf0] truncate tracking-tight"
+                                title={cand.title}
+                              >
+                                {cand.title}
+                              </span>
+                            </div>
+
+                            <div className="flex items-center gap-2 ml-2 flex-shrink-0">
+                              {cand.exists_locally ? (
+                                <span className="flex items-center gap-1 text-[10px] text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20 font-medium">
+                                  <CheckCircle2 size={10} />
+                                  {t.modals.badgeIncremental}
+                                </span>
+                              ) : (
+                                <span className="text-[10px] text-[#0071e3] dark:text-[#2997ff] bg-[#0071e3]/10 px-2 py-0.5 rounded-full border border-[#0071e3]/20 font-medium">
+                                  {t.modals.badgeNotImported}
+                                </span>
+                              )}
+
+                              <span className="text-[10px] text-[#86868b] font-mono">
+                                {formatDateTime(cand.last_modified_time)}
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        {/* Footer info & Buttons */}
+        <div className="flex items-center justify-between pt-3 border-t border-black/[0.08] dark:border-white/[0.08]">
+          <div className="text-[11px] text-[#6e6e73] dark:text-[#86868b]">
+            {interpolate(t.modals.selectedSummary, { count: selectedIds.size })}
+          </div>
+
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" size="sm" onClick={onClose} disabled={isRecovering}>
+              {t.common.cancel}
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
+              icon={isRecovering ? <RefreshCw size={13} className="animate-spin" /> : undefined}
+              disabled={isRecovering || selectedIds.size === 0}
+              onClick={handleConfirm}
+            >
+              {isRecovering ? t.modals.recovering : interpolate(t.modals.executeRecovery, { count: selectedIds.size })}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </Modal>
+  );
+};

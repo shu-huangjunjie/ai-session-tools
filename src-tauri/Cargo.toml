@@ -1,0 +1,37 @@
+[package]
+name = "context-vault"
+version = "0.1.3"
+description = "Windows 本地 Codex 会话恢复与整理工具 (TypeScript + Rust)"
+edition = "2021"
+
+[lib]
+name = "context_vault_lib"
+crate-type = ["lib"]
+
+[profile.dev]
+incremental = true
+debug = 1
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[dependencies]
+tauri = { version = "2.0", features = [] }
+tauri-plugin-shell = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rusqlite = { version = "0.31", features = ["bundled", "bundled-full"] }
+uuid = { version = "1.8", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+zip = { version = "2.1", default-features = false, features = ["deflate"] }
+regex = "1.10"
+dirs = "5.0"
+thiserror = "1.0"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell"] }
