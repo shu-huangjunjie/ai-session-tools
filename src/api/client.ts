@@ -27,6 +27,10 @@ import {
   ImportResult,
   ResetResult,
   ResetScope,
+  SkillClient,
+  SkillDeleteOutcome,
+  SkillEntry,
+  SkillLocation,
 } from '../types';
 import { folderPinKey } from '../utils/folderPins';
 
@@ -216,6 +220,35 @@ export const api = {
     invokeTauri<string | null>('pick_open_path', {
       initialDir: initialDir || null,
     }),
+
+  // Skills. `libraries` are the library folders the user registered; the backend
+  // only changes skills inside them and the client skills folders.
+  listSkills: (libraries: string[]) =>
+    invokeTauri<SkillLocation[]>('list_skills', { libraries }),
+
+  readSkillFile: (libraries: string[], path: string) =>
+    invokeTauri<string>('read_skill_file', { libraries, path }),
+
+  /** `target` is `claude`, `codex` or a library folder; returns the new skill folder. */
+  createSkill: (
+    libraries: string[],
+    target: string,
+    folderName: string,
+    description: string,
+    mountTo: SkillClient[] = []
+  ) =>
+    invokeTauri<string>('create_skill', { libraries, target, folderName, description, mountTo }),
+
+  /** Moves a client skill to or from `skills-disabled`; returns its new path. */
+  setSkillEnabled: (libraries: string[], path: string, enabled: boolean) =>
+    invokeTauri<string>('set_skill_enabled', { libraries, path, enabled }),
+
+  /** Links a library skill into a client skills folder with a directory junction. */
+  mountSkill: (libraries: string[], path: string, client: SkillClient) =>
+    invokeTauri<string>('mount_skill', { libraries, path, client }),
+
+  deleteSkill: (libraries: string[], path: string) =>
+    invokeTauri<SkillDeleteOutcome>('delete_skill', { libraries, path }),
 };
 
 /** Tauri rejects with a plain string; other failures arrive as Error objects. */
@@ -328,11 +361,125 @@ pub fn discover(custom_root: Option<&Path>) -> Result<AppPaths, std::io::Error> 
   ],
 };
 
+// Skills for the browser preview, keyed by folder path.
+const MOCK_SKILL_ROOTS: Record<SkillClient, { root: string; disabled: string }> = {
+  claude: { root: 'C:\\Users\\Demo\\.claude\\skills', disabled: 'C:\\Users\\Demo\\.claude\\skills-disabled' },
+  codex: { root: 'C:\\Users\\Demo\\.codex\\skills', disabled: 'C:\\Users\\Demo\\.codex\\skills-disabled' },
+};
+const MOCK_LIBRARY = 'E:\\skills\\claude';
+
+function mockSkill(dir: string, folder: string, description: string, extra: Partial<SkillEntry> = {}): SkillEntry {
+  return {
+    folder_name: folder,
+    name: folder,
+    description,
+    path: `${dir}\\${folder}`,
+    link_target: null,
+    link_broken: false,
+    has_skill_file: true,
+    enabled: true,
+    system: false,
+    file_count: 1,
+    total_bytes: 3501,
+    modified_at: new Date(Date.now() - 3600000 * 5).toISOString(),
+    mounted_in: [],
+    ...extra,
+  };
+}
+
+const MOCK_SKILLS: SkillEntry[] = [
+  mockSkill(MOCK_LIBRARY, 'word-editing-preferences', '编辑本用户的 Word 报告时必须遵守的格式与流程偏好。'),
+  mockSkill(MOCK_LIBRARY, 'codex-image-generation', '需要生成或编辑位图图片时使用，默认通过本机 Codex 生图。', { file_count: 2 }),
+  mockSkill(MOCK_SKILL_ROOTS.claude.root, 'word-editing-preferences', '编辑本用户的 Word 报告时必须遵守的格式与流程偏好。', {
+    link_target: `${MOCK_LIBRARY}\\word-editing-preferences`,
+  }),
+  mockSkill(MOCK_SKILL_ROOTS.claude.disabled, 'old-notes', '旧的笔记整理技能。', { enabled: false }),
+  mockSkill(`${MOCK_SKILL_ROOTS.codex.root}\\.system`, 'imagegen', 'Generate or edit raster images.', { system: true }),
+];
+
+const parentDir = (path: string) => path.slice(0, path.lastIndexOf('\\'));
+
+function mockSkillLocations(libraries: string[]): SkillLocation[] {
+  const linked = (target: string) =>
+    (['claude', 'codex'] as SkillClient[]).filter((client) =>
+      MOCK_SKILLS.some(
+        (s) =>
+          s.link_target === target &&
+          [MOCK_SKILL_ROOTS[client].root, MOCK_SKILL_ROOTS[client].disabled].includes(parentDir(s.path))
+      )
+    );
+  const inDirs = (...dirs: string[]) => MOCK_SKILLS.filter((s) => dirs.includes(parentDir(s.path)));
+  const clients = (['claude', 'codex'] as SkillClient[]).map((client) => ({
+    kind: client,
+    root: MOCK_SKILL_ROOTS[client].root,
+    disabled_root: MOCK_SKILL_ROOTS[client].disabled,
+    exists: true,
+    skills: inDirs(
+      MOCK_SKILL_ROOTS[client].root,
+      MOCK_SKILL_ROOTS[client].disabled,
+      `${MOCK_SKILL_ROOTS[client].root}\\.system`
+    ).map((s) => ({ ...s })),
+  }));
+  return [
+    ...clients,
+    ...libraries.map((root) => ({
+      kind: 'library' as const,
+      root,
+      disabled_root: null,
+      exists: root === MOCK_LIBRARY,
+      skills: inDirs(root).map((s) => ({ ...s, mounted_in: linked(s.path) })),
+    })),
+  ];
+}
+
 async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   console.log(`[Mock API] Invoke: ${cmd}`, args);
   await new Promise((r) => setTimeout(r, 80)); // simulate brief IPC delay
 
   switch (cmd) {
+    case 'list_skills':
+      return mockSkillLocations((args?.libraries as string[]) || []) as unknown as T;
+    case 'read_skill_file': {
+      const skill = MOCK_SKILLS.find((s) => s.path === args?.path);
+      if (!skill) throw '技能不存在';
+      return `---\nname: ${skill.folder_name}\ndescription: ${skill.description}\n---\n\n# ${skill.folder_name}\n\n（浏览器预览中的示例内容）\n` as unknown as T;
+    }
+    case 'create_skill': {
+      const target = args?.target as string;
+      const dir = target === 'claude' || target === 'codex' ? MOCK_SKILL_ROOTS[target].root : target;
+      const folder = args?.folderName as string;
+      if (MOCK_SKILLS.some((s) => s.path === `${dir}\\${folder}`)) throw `已存在同名技能：${dir}\\${folder}`;
+      const created = mockSkill(dir, folder, args?.description as string);
+      MOCK_SKILLS.push(created);
+      for (const client of (args?.mountTo as SkillClient[]) || []) {
+        MOCK_SKILLS.push(mockSkill(MOCK_SKILL_ROOTS[client].root, folder, created.description || '', { link_target: created.path }));
+      }
+      return created.path as unknown as T;
+    }
+    case 'set_skill_enabled': {
+      const skill = MOCK_SKILLS.find((s) => s.path === args?.path);
+      if (!skill) throw '技能不存在';
+      const client = (['claude', 'codex'] as SkillClient[]).find((c) => skill.path.includes(c === 'claude' ? '.claude' : '.codex'))!;
+      const enabled = args?.enabled as boolean;
+      skill.enabled = enabled;
+      skill.path = `${enabled ? MOCK_SKILL_ROOTS[client].root : MOCK_SKILL_ROOTS[client].disabled}\\${skill.folder_name}`;
+      return skill.path as unknown as T;
+    }
+    case 'mount_skill': {
+      const source = MOCK_SKILLS.find((s) => s.path === args?.path);
+      const client = args?.client as SkillClient;
+      if (!source) throw '技能不存在';
+      const link = mockSkill(MOCK_SKILL_ROOTS[client].root, source.folder_name, source.description || '', { link_target: source.path });
+      if (MOCK_SKILLS.some((s) => s.path === link.path)) throw `客户端中已有同名技能：${link.path}`;
+      MOCK_SKILLS.push(link);
+      return link.path as unknown as T;
+    }
+    case 'delete_skill': {
+      const index = MOCK_SKILLS.findIndex((s) => s.path === args?.path);
+      if (index < 0) throw '技能不存在';
+      const [removed] = MOCK_SKILLS.splice(index, 1);
+      return (removed.link_target ? 'link_removed' : 'recycled') as unknown as T;
+    }
     case 'list_folder_pins':
       return [...MOCK_FOLDER_PINS] as unknown as T;
     case 'set_folder_pinned': {

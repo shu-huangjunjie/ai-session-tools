@@ -8,6 +8,7 @@ import {
   Sun,
   UploadCloud,
   Languages,
+  Puzzle,
   Terminal,
 } from 'lucide-react';
 import { Button } from './common/Button';
@@ -27,6 +28,7 @@ interface HeaderProps {
   claudeCount: number;
   onBackup: () => void;
   onOpenImport: () => void;
+  onOpenSkills: () => void;
   theme: 'dark' | 'light';
   onToggleTheme: () => void;
   onOpenClient?: (source: SourceCategory) => void;
@@ -44,6 +46,7 @@ export const Header: React.FC<HeaderProps> = ({
   claudeCount,
   onBackup,
   onOpenImport,
+  onOpenSkills,
   theme,
   onToggleTheme,
 }) => {
@@ -196,6 +199,16 @@ export const Header: React.FC<HeaderProps> = ({
               <span className="text-[11px]">{t.header.darkMode}</span>
             </div>
           )}
+        </Button>
+
+        <Button
+          variant="ghost"
+          size="sm"
+          icon={<Puzzle size={13} className="text-[#86868b]" />}
+          onClick={onOpenSkills}
+          title={t.skills.buttonTooltip}
+        >
+          {t.skills.button}
         </Button>
 
         <Button

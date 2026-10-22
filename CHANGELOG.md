@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add skill management (header button "技能"). It lists the Claude (`~/.claude/skills`) and Codex (`$CODEX_HOME` or `~/.codex/skills`) skills with their SKILL.md name and description, previews SKILL.md, and opens a skill in Explorer or VS Code. Codex built-in skills under `.system` are shown read-only.
+- Register skill library folders (kept per user in the browser storage). Mount a library skill into Claude or Codex with a directory junction and unmount it again; the files stay only in the library. Library skills show where they are mounted and cannot be deleted while mounted.
+- Create a skill with a SKILL.md template in a client or library folder, optionally mounting it right away. Names follow the client rules (lowercase letters, digits and hyphens, up to 64 characters).
+- Disable a client skill by moving it to the sibling `skills-disabled` folder, which the client does not load, and enable it again. Deleting a link removes only the link; deleting a real skill folder moves it to the Recycle Bin. The backend only changes folders directly inside the client skills folders and the registered libraries.
+
 ## 0.1.3 (2026-10-21)
 
 - Add independent work-folder pins through the folder header or its context menu. Pinned folders appear above ordinary groups, persist by source and normalized Windows path, and retain their header when all children are individually pinned. Schema 9 backs up and upgrades existing databases. Clearing the vault also clears folder pins.

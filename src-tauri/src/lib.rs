@@ -119,6 +119,14 @@ pub fn run() {
             commands::stop_claude_client,
             commands::start_claude_client,
 
+            // Skills
+            commands::list_skills,
+            commands::read_skill_file,
+            commands::create_skill,
+            commands::set_skill_enabled,
+            commands::mount_skill,
+            commands::delete_skill,
+
             // Importers
             commands::preview_import,
             commands::execute_import,

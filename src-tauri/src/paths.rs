@@ -84,6 +84,19 @@ impl AppPaths {
             .unwrap_or_else(|| PathBuf::from(".gemini").join("antigravity"))
     }
 
+    /// Codex 数据根目录：与 Codex 一致，优先 `CODEX_HOME`，否则为 `~/.codex`。
+    pub fn codex_home(&self) -> PathBuf {
+        if let Ok(env_home) = env::var("CODEX_HOME") {
+            let p = PathBuf::from(env_home);
+            if p.is_dir() {
+                return p;
+            }
+        }
+        dirs::home_dir()
+            .map(|h| h.join(".codex"))
+            .unwrap_or_else(|| PathBuf::from(".codex"))
+    }
+
     /// 自动发现 Claude 数据根目录：
     /// 1. 便携模式：检查同级 `./data/claude`
     /// 2. 环境变量：检查 `CLAUDE_HOME` 或 `CLAUDE_CONFIG_DIR`

@@ -9,6 +9,7 @@ pub mod codex_publisher;
 pub mod codex_recovery;
 pub mod data_service;
 pub mod process_util;
+pub mod skill_manager;
 pub mod vscode_launcher;
 
 pub use antigravity_client_controller::*;
@@ -21,4 +22,5 @@ pub use codex_client_controller::*;
 pub use codex_publisher::*;
 pub use codex_recovery::*;
 pub use data_service::*;
+pub use skill_manager::*;
 pub use vscode_launcher::*;
