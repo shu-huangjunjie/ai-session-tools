@@ -122,4 +122,14 @@ impl AppPaths {
             .map(|h| h.join(".claude"))
             .unwrap_or_else(|| PathBuf::from(".claude"))
     }
+
+    /// Claude Code 的用户配置 `.claude.json`（含用户级 `mcpServers`）：数据目录是默认的
+    /// `~/.claude` 时位于用户主目录，否则（`CLAUDE_CONFIG_DIR` 或便携模式）位于该目录内。
+    pub fn claude_json(&self) -> PathBuf {
+        let home = self.claude_home();
+        match dirs::home_dir() {
+            Some(user) if home == user.join(".claude") => user.join(".claude.json"),
+            _ => home.join(".claude.json"),
+        }
+    }
 }

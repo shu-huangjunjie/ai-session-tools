@@ -24,6 +24,11 @@ import {
   ConversationSummary,
   FolderPin,
   ImportPreview,
+  McpClient,
+  McpCopyOutcome,
+  McpLocation,
+  McpServerEntry,
+  McpSpec,
   ImportResult,
   ResetResult,
   ResetScope,
@@ -247,8 +252,29 @@ export const api = {
   mountSkill: (libraries: string[], path: string, client: SkillClient) =>
     invokeTauri<string>('mount_skill', { libraries, path, client }),
 
+  /** Links a client skill into the other client's skills folder; returns the new link. */
+  linkSkillToClient: (libraries: string[], path: string, client: SkillClient) =>
+    invokeTauri<string>('link_skill_to_client', { libraries, path, client }),
+
   deleteSkill: (libraries: string[], path: string) =>
     invokeTauri<SkillDeleteOutcome>('delete_skill', { libraries, path }),
+
+  // MCP servers. The config files are the source of truth; the backend backs them up before each write.
+  listMcpServers: () => invokeTauri<McpLocation[]>('list_mcp_servers'),
+
+  /** Creates a server when `original` is null, otherwise edits (and may rename) it. */
+  upsertMcpServer: (client: McpClient, original: string | null, name: string, spec: McpSpec) =>
+    invokeTauri<void>('upsert_mcp_server', { client, original, name, spec }),
+
+  setMcpEnabled: (client: McpClient, name: string, enabled: boolean) =>
+    invokeTauri<void>('set_mcp_enabled', { client, name, enabled }),
+
+  deleteMcpServer: (client: McpClient, name: string) =>
+    invokeTauri<void>('delete_mcp_server', { client, name }),
+
+  /** Copies a server into the other client, converting the format; `overwrite` replaces an enabled entry. */
+  copyMcpServer: (from: McpClient, name: string, to: McpClient, overwrite: boolean) =>
+    invokeTauri<McpCopyOutcome>('copy_mcp_server', { from, name, to, overwrite }),
 };
 
 /** Tauri rejects with a plain string; other failures arrive as Error objects. */
@@ -383,6 +409,8 @@ function mockSkill(dir: string, folder: string, description: string, extra: Part
     total_bytes: 3501,
     modified_at: new Date(Date.now() - 3600000 * 5).toISOString(),
     mounted_in: [],
+    shared_with: [],
+    cc_switch: null,
     ...extra,
   };
 }
@@ -398,6 +426,45 @@ const MOCK_SKILLS: SkillEntry[] = [
 ];
 
 const parentDir = (path: string) => path.slice(0, path.lastIndexOf('\\'));
+
+// MCP servers for the browser preview.
+const MOCK_MCP_PATHS: Record<McpClient, string> = {
+  claude: 'C:\\Users\\Demo\\.claude.json',
+  codex: 'C:\\Users\\Demo\\.codex\\config.toml',
+};
+
+function mockMcp(client: McpClient, name: string, spec: McpSpec, extra: Partial<McpServerEntry> = {}): McpServerEntry {
+  const transport = (spec.type as string) || (spec.url ? 'http' : 'stdio');
+  return {
+    client,
+    name,
+    transport,
+    spec: { type: transport, ...spec },
+    enabled: true,
+    read_only: false,
+    cc_switch: null,
+    raw: JSON.stringify({ [name]: spec }, null, 2),
+    ...extra,
+  };
+}
+
+const MOCK_MCP: McpServerEntry[] = [
+  mockMcp('claude', 'pencil', { command: 'C:\\Tools\\pencil.exe', args: ['--app', 'desktop'], env: {} }, { cc_switch: true }),
+  mockMcp('claude', 'blender', { command: 'E:\\tools\\blender-mcp\\venv\\Scripts\\blender-mcp.exe', args: [], env: {} }),
+  mockMcp('claude', 'docs-search', { type: 'http', url: 'https://example.com/mcp', headers: { Authorization: 'Bearer demo-token' } }, { enabled: false }),
+  mockMcp('codex', 'pencil', { command: 'C:\\Tools\\pencil.exe', args: ['--app', 'desktop'] }, { cc_switch: true }),
+  mockMcp('codex', 'node_repl', { command: 'node.exe', args: ['repl.js'], env: { CODEX_HOME: 'C:\\Users\\Demo\\.codex' } }, { read_only: true }),
+];
+
+function mockMcpLocations(): McpLocation[] {
+  return (['claude', 'codex'] as McpClient[]).map((client) => ({
+    client,
+    config_path: MOCK_MCP_PATHS[client],
+    exists: true,
+    error: null,
+    servers: MOCK_MCP.filter((s) => s.client === client).map((s) => ({ ...s })),
+  }));
+}
 
 function mockSkillLocations(libraries: string[]): SkillLocation[] {
   const linked = (target: string) =>
@@ -473,6 +540,53 @@ async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Promi
       if (MOCK_SKILLS.some((s) => s.path === link.path)) throw `客户端中已有同名技能：${link.path}`;
       MOCK_SKILLS.push(link);
       return link.path as unknown as T;
+    }
+    case 'link_skill_to_client': {
+      const source = MOCK_SKILLS.find((s) => s.path === args?.path);
+      const client = args?.client as SkillClient;
+      if (!source) throw '技能不存在';
+      const link = mockSkill(MOCK_SKILL_ROOTS[client].root, source.folder_name, source.description || '', {
+        link_target: source.link_target || source.path,
+      });
+      if (MOCK_SKILLS.some((s) => s.path === link.path)) throw `客户端中已有同名技能：${link.path}`;
+      MOCK_SKILLS.push(link);
+      return link.path as unknown as T;
+    }
+    case 'list_mcp_servers':
+      return mockMcpLocations() as unknown as T;
+    case 'upsert_mcp_server': {
+      const client = args?.client as McpClient;
+      const original = args?.original as string | null;
+      const name = args?.name as string;
+      const index = original ? MOCK_MCP.findIndex((s) => s.client === client && s.name === original) : -1;
+      if (original !== name && MOCK_MCP.some((s) => s.client === client && s.name === name)) throw `已有同名服务器：${name}`;
+      const entry = mockMcp(client, name, args?.spec as McpSpec, { enabled: index >= 0 ? MOCK_MCP[index].enabled : true });
+      if (index >= 0) MOCK_MCP[index] = entry;
+      else MOCK_MCP.push(entry);
+      return undefined as T;
+    }
+    case 'set_mcp_enabled': {
+      const entry = MOCK_MCP.find((s) => s.client === args?.client && s.name === args?.name);
+      if (!entry) throw '服务器不存在';
+      entry.enabled = args?.enabled as boolean;
+      return undefined as T;
+    }
+    case 'delete_mcp_server': {
+      const index = MOCK_MCP.findIndex((s) => s.client === args?.client && s.name === args?.name);
+      if (index < 0) throw '服务器不存在';
+      MOCK_MCP.splice(index, 1);
+      return undefined as T;
+    }
+    case 'copy_mcp_server': {
+      const source = MOCK_MCP.find((s) => s.client === args?.from && s.name === args?.name);
+      const to = args?.to as McpClient;
+      if (!source) throw '服务器不存在';
+      const index = MOCK_MCP.findIndex((s) => s.client === to && s.name === source.name);
+      if (index >= 0 && !args?.overwrite) throw `已有同名服务器：${source.name}`;
+      const copy = mockMcp(to, source.name, source.spec);
+      if (index >= 0) MOCK_MCP[index] = copy;
+      else MOCK_MCP.push(copy);
+      return { dropped_fields: [] } as unknown as T;
     }
     case 'delete_skill': {
       const index = MOCK_SKILLS.findIndex((s) => s.path === args?.path);

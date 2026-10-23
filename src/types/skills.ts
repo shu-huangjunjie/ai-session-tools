@@ -24,6 +24,10 @@ export interface SkillEntry {
   modified_at?: string | null;
   /** Clients a library skill is mounted into. */
   mounted_in: SkillClient[];
+  /** For a client skill: the other clients that hold the same original (a link to it, or the folder itself). */
+  shared_with?: SkillClient[];
+  /** Whether cc-switch enables a skill of this name for this client; null when it has none. */
+  cc_switch?: boolean | null;
 }
 
 export interface SkillLocation {

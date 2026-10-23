@@ -28,6 +28,7 @@ import { ClaudeRecoveryModal } from './components/ClaudeRecoveryModal';
 import { ClaudePublishModal } from './components/ClaudePublishModal';
 import { ImportModal } from './components/ImportModal';
 import { SkillsManager } from './components/SkillsManager';
+import { McpManager } from './components/McpManager';
 
 import { Modal } from './components/common/Modal';
 import { Button } from './components/common/Button';
@@ -204,6 +205,7 @@ export const App: React.FC = () => {
 
   const [importModalOpen, setImportModalOpen] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(false);
+  const [mcpOpen, setMcpOpen] = useState(false);
 
   // Codex publish confirmation
   const [codexPublishDialog, setCodexPublishDialog] = useState<{
@@ -240,6 +242,7 @@ export const App: React.FC = () => {
     claudePublishModalOpen ||
     importModalOpen ||
     skillsOpen ||
+    mcpOpen ||
     renameDialog !== null ||
     deleteDialog !== null ||
     codexPublishDialog !== null ||
@@ -924,6 +927,7 @@ export const App: React.FC = () => {
         onBackup={handleBackup}
         onOpenImport={() => setImportModalOpen(true)}
         onOpenSkills={() => setSkillsOpen(true)}
+        onOpenMcp={() => setMcpOpen(true)}
         theme={theme}
         onToggleTheme={toggleTheme}
         onOpenClient={handleOpenClient}
@@ -1054,6 +1058,7 @@ export const App: React.FC = () => {
 
       {/* Skills */}
       <SkillsManager isOpen={skillsOpen} onClose={() => setSkillsOpen(false)} onToast={addToast} />
+      <McpManager isOpen={mcpOpen} onClose={() => setMcpOpen(false)} onToast={addToast} />
 
       {/* Codex Publish Confirmation */}
       {codexPublishDialog && (

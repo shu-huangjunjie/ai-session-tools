@@ -13,6 +13,7 @@ vi.mock('../api/client', () => ({
     createSkill: vi.fn(),
     setSkillEnabled: vi.fn(),
     mountSkill: vi.fn(),
+    linkSkillToClient: vi.fn(),
     deleteSkill: vi.fn(),
     pickFolderPath: vi.fn(),
     openFolder: vi.fn(),
@@ -62,6 +63,7 @@ beforeEach(() => {
   vi.mocked(api.listSkills).mockImplementation(async () => locations());
   vi.mocked(api.readSkillFile).mockResolvedValue('---\nname: x\n---\nbody text');
   vi.mocked(api.mountSkill).mockResolvedValue('linked');
+  vi.mocked(api.linkSkillToClient).mockResolvedValue('linked');
   vi.mocked(api.deleteSkill).mockResolvedValue('link_removed');
   vi.mocked(api.createSkill).mockResolvedValue(`${LIB}\\new-skill`);
   vi.mocked(api.setSkillEnabled).mockResolvedValue('moved');
@@ -130,4 +132,32 @@ test('deleting a link explains that the target folder is kept', async () => {
   await user.click(deleteButtons[deleteButtons.length - 1]);
   await waitFor(() => expect(api.deleteSkill).toHaveBeenCalledWith([LIB], `${CLAUDE}\\word-prefs`));
   expect(toast).toHaveBeenCalledWith('success', 'Removed link: word-prefs');
+});
+
+test('client skills sync to the other client and keep a linked original from being deleted', async () => {
+  const user = userEvent.setup();
+  const CODEX = 'C:\\Users\\Demo\\.codex\\skills';
+  vi.mocked(api.listSkills).mockImplementation(async () => [
+    {
+      kind: 'claude', root: CLAUDE, exists: true,
+      skills: [skill(CLAUDE, 'local', { shared_with: ['codex'], cc_switch: true }), skill(CLAUDE, 'solo')],
+    },
+    { kind: 'codex', root: CODEX, exists: true, skills: [skill(CODEX, 'local', { link_target: `${CLAUDE}\\local`, shared_with: ['claude'] })] },
+  ]);
+  renderManager();
+  await user.click(await screen.findByText('solo'));
+  await user.click(screen.getByRole('button', { name: 'Sync to Codex' }));
+  expect(api.linkSkillToClient).toHaveBeenCalledWith([LIB], `${CLAUDE}\\solo`, 'codex');
+
+  await user.click(screen.getByText('local'));
+  expect(screen.getByText('Also in Codex')).toBeTruthy();
+  expect(screen.getAllByText(/cc-switch tracks this skill/).length).toBeGreaterThan(0);
+  expect((screen.getByRole('button', { name: 'Delete' }) as HTMLButtonElement).disabled).toBe(true);
+  await user.click(screen.getByRole('button', { name: 'Unsync from Codex' }));
+  expect(api.deleteSkill).toHaveBeenCalledWith([LIB], `${CODEX}\\local`);
+
+  // From the Codex side the original lives in Claude, so there is nothing to unsync there.
+  await user.click(screen.getByRole('button', { name: /^Codex/ }));
+  await user.click(within(screen.getByRole('list')).getByText('local'));
+  expect(screen.queryByRole('button', { name: 'Unsync from Claude' })).toBeNull();
 });

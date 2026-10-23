@@ -3,6 +3,7 @@ pub mod claude_commands;
 pub mod codex_commands;
 pub mod conversation_commands;
 pub mod import_commands;
+pub mod mcp_commands;
 pub mod skill_commands;
 pub mod system_commands;
 
@@ -11,6 +12,7 @@ pub use claude_commands::*;
 pub use codex_commands::*;
 pub use conversation_commands::*;
 pub use import_commands::*;
+pub use mcp_commands::*;
 pub use skill_commands::*;
 pub use system_commands::*;
 

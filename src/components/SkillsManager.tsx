@@ -16,6 +16,7 @@ import {
 import { api, errorMessage } from '../api/client';
 import { SkillClient, SkillEntry, SkillLocation } from '../types';
 import { formatDateTime } from '../utils/formatters';
+import { Badge } from './common/Badge';
 import { Button } from './common/Button';
 import { Modal } from './common/Modal';
 import { useI18n } from '../i18n';
@@ -36,6 +37,9 @@ const NAME_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 /** Windows paths compare case-insensitively and with either separator. */
 export const pathKey = (path: string) => path.replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
 const baseName = (path: string) => path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || path;
+/** The original folder a skill stands for: a link's target, otherwise the folder itself. */
+const realKey = (skill: SkillEntry) => pathKey(skill.link_target || skill.path);
+const otherClient = (client: SkillClient): SkillClient => (client === 'claude' ? 'codex' : 'claude');
 const tabKey = (location: SkillLocation) =>
   location.kind === 'library' ? `library:${pathKey(location.root)}` : location.kind;
 
@@ -53,26 +57,6 @@ function loadLibraries(): string[] {
     return [];
   }
 }
-
-const Badge: React.FC<{ tone: 'gray' | 'blue' | 'red' | 'orange' | 'purple' | 'green'; children: React.ReactNode; title?: string }> = ({
-  tone,
-  children,
-  title,
-}) => {
-  const tones = {
-    gray: 'bg-black/[0.05] dark:bg-white/[0.08] text-[#6e6e73] dark:text-[#a1a1a6]',
-    blue: 'bg-[#0071e3]/10 text-[#0071e3] dark:text-[#2997ff]',
-    red: 'bg-[#ff3b30]/10 text-[#d70015] dark:text-[#ff453a]',
-    orange: 'bg-[#ff9f0a]/15 text-[#c93400] dark:text-[#ff9f0a]',
-    purple: 'bg-[#af52de]/10 text-[#af52de] dark:text-[#bf5af2]',
-    green: 'bg-[#34c759]/12 text-[#248a3d] dark:text-[#30d158]',
-  }[tone];
-  return (
-    <span title={title} className={`inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded-full ${tones}`}>
-      {children}
-    </span>
-  );
-};
 
 export const SkillsManager: React.FC<SkillsManagerProps> = ({ isOpen, onClose, onToast }) => {
   const { t, interpolate } = useI18n();
@@ -204,6 +188,28 @@ export const SkillsManager: React.FC<SkillsManagerProps> = ({ isOpen, onClose, o
       const path = await api.setSkillEnabled(libraries, skill.path, !skill.enabled);
       onToast('success', interpolate(skill.enabled ? s.toastDisabled : s.toastEnabled, { name: skill.folder_name }));
       setSelectedPath(path);
+      await refresh();
+    });
+
+  // The other client's link to the same original as a client skill; only links may be unsynced.
+  const sharedLink = useCallback(
+    (skill: SkillEntry, client: SkillClient) =>
+      locations
+        .find((l) => l.kind === client)
+        ?.skills.find((sk) => sk.link_target && realKey(sk) === realKey(skill)),
+    [locations]
+  );
+
+  const toggleSync = (skill: SkillEntry, client: SkillClient) =>
+    run(async () => {
+      const link = sharedLink(skill, client);
+      if (link) {
+        await api.deleteSkill(libraries, link.path);
+        onToast('success', interpolate(s.toastUnsynced, { name: skill.folder_name, client: CLIENT_LABEL[client] }));
+      } else {
+        await api.linkSkillToClient(libraries, skill.path, client);
+        onToast('success', interpolate(s.toastSynced, { name: skill.folder_name, client: CLIENT_LABEL[client] }));
+      }
       await refresh();
     });
 
@@ -339,6 +345,10 @@ export const SkillsManager: React.FC<SkillsManagerProps> = ({ isOpen, onClose, o
                     {skill.mounted_in.length > 0 && (
                       <Badge tone="green">{interpolate(s.mountedIn, { clients: skill.mounted_in.map((c) => CLIENT_LABEL[c]).join(' · ') })}</Badge>
                     )}
+                    {(skill.shared_with?.length ?? 0) > 0 && (
+                      <Badge tone="green">{interpolate(s.sharedWith, { clients: skill.shared_with!.map((c) => CLIENT_LABEL[c]).join(' · ') })}</Badge>
+                    )}
+                    {skill.cc_switch != null && <Badge tone="orange" title={s.ccSwitchHint}>{s.ccSwitch}</Badge>}
                   </div>
                   {skill.description && (
                     <p className="mt-1 text-[11px] text-[#6e6e73] dark:text-[#a1a1a6] leading-relaxed line-clamp-2">{skill.description}</p>
@@ -435,19 +445,51 @@ export const SkillsManager: React.FC<SkillsManagerProps> = ({ isOpen, onClose, o
                         </Button>
                       );
                     })}
-                  {!selected.system && (
-                    <Button
-                      size="sm"
-                      variant="danger"
-                      icon={<Trash2 size={13} />}
-                      disabled={busy || selected.mounted_in.length > 0}
-                      title={selected.mounted_in.length > 0 ? s.deleteMountedBlocked : undefined}
-                      onClick={() => setConfirmDelete(true)}
-                    >
-                      {s.delete}
-                    </Button>
-                  )}
+                  {(selectedLocation?.kind === 'claude' || selectedLocation?.kind === 'codex') &&
+                    !selected.system &&
+                    (() => {
+                      const client = otherClient(selectedLocation.kind);
+                      const synced = Boolean(selected.shared_with?.includes(client));
+                      // The other side holds the original folder: unsyncing there would delete it.
+                      if (synced && !sharedLink(selected, client)) return null;
+                      return (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          icon={synced ? <Unlink size={13} /> : <Link2 size={13} />}
+                          disabled={busy || selected.link_broken || (!synced && !selected.has_skill_file)}
+                          title={s.syncHint}
+                          onClick={() => toggleSync(selected, client)}
+                        >
+                          {interpolate(synced ? s.unsyncFrom : s.syncTo, { client: CLIENT_LABEL[client] })}
+                        </Button>
+                      );
+                    })()}
+                  {!selected.system && (() => {
+                    // Deleting an original another client links to would break that client's skill.
+                    const sharedOriginal = !selected.link_target && (selected.shared_with?.length ?? 0) > 0;
+                    const blocked = selected.mounted_in.length > 0 || sharedOriginal;
+                    return (
+                      <Button
+                        size="sm"
+                        variant="danger"
+                        icon={<Trash2 size={13} />}
+                        disabled={busy || blocked}
+                        title={selected.mounted_in.length > 0 ? s.deleteMountedBlocked : sharedOriginal ? s.deleteSharedBlocked : undefined}
+                        onClick={() => setConfirmDelete(true)}
+                      >
+                        {s.delete}
+                      </Button>
+                    );
+                  })()}
                 </div>
+
+                {selected.cc_switch != null && (
+                  <p className="flex items-start gap-1.5 text-[11px] text-[#c93400] dark:text-[#ff9f0a] leading-relaxed">
+                    <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+                    {s.ccSwitchHint}
+                  </p>
+                )}
 
                 {confirmDelete && (
                   <div className="p-3 rounded-2xl border border-[#ff453a]/25 bg-[#ff453a]/[0.06] flex items-center gap-3">

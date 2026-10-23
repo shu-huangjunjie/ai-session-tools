@@ -125,7 +125,15 @@ pub fn run() {
             commands::create_skill,
             commands::set_skill_enabled,
             commands::mount_skill,
+            commands::link_skill_to_client,
             commands::delete_skill,
+
+            // MCP servers
+            commands::list_mcp_servers,
+            commands::upsert_mcp_server,
+            commands::set_mcp_enabled,
+            commands::delete_mcp_server,
+            commands::copy_mcp_server,
 
             // Importers
             commands::preview_import,

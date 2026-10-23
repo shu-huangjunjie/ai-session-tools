@@ -1,7 +1,7 @@
 use tauri::State;
 
 use super::run_blocking;
-use crate::services::{SkillClient, SkillDeleteOutcome, SkillLocation, SkillManager};
+use crate::services::{CcSwitchState, SkillClient, SkillDeleteOutcome, SkillLocation, SkillLocationKind, SkillManager};
 use crate::AppState;
 
 /// `libraries` 是用户登记的技能库文件夹；写操作只接受这些目录和客户端技能目录中的技能。
@@ -15,7 +15,22 @@ pub async fn list_skills(
     libraries: Vec<String>,
 ) -> Result<Vec<SkillLocation>, String> {
     let m = manager(&state, &libraries);
-    run_blocking(move || Ok(m.list())).await
+    run_blocking(move || {
+        let mut locations = m.list();
+        // 标注 cc-switch 管理的技能：它重新同步时会按自己的记录改回这些技能。
+        let cc_switch = CcSwitchState::detect();
+        for location in &mut locations {
+            for skill in &mut location.skills {
+                skill.cc_switch = cc_switch.skill(&skill.folder_name).and_then(|apps| match location.kind {
+                    SkillLocationKind::Claude => Some(apps.claude),
+                    SkillLocationKind::Codex => Some(apps.codex),
+                    SkillLocationKind::Library => None,
+                });
+            }
+        }
+        Ok(locations)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -69,6 +84,18 @@ pub async fn mount_skill(
 ) -> Result<String, String> {
     let m = manager(&state, &libraries);
     run_blocking(move || Ok(m.mount(&path, client)?.to_string_lossy().to_string())).await
+}
+
+/// 把客户端中的技能以目录联接同步到另一个客户端。
+#[tauri::command]
+pub async fn link_skill_to_client(
+    state: State<'_, AppState>,
+    libraries: Vec<String>,
+    path: String,
+    client: SkillClient,
+) -> Result<String, String> {
+    let m = manager(&state, &libraries);
+    run_blocking(move || Ok(m.link_to_client(&path, client)?.to_string_lossy().to_string())).await
 }
 
 #[tauri::command]

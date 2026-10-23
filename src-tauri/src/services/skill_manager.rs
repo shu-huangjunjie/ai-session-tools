@@ -58,6 +58,10 @@ pub struct SkillEntry {
     pub modified_at: Option<String>,
     /// 技能库中的技能已挂载到哪些客户端。
     pub mounted_in: Vec<SkillClient>,
+    /// 客户端技能在另一个客户端中也有（指向同一原件的联接或就是同一文件夹）。
+    pub shared_with: Vec<SkillClient>,
+    /// cc-switch 登记了同名技能时，它对该客户端是否启用；未登记为空。
+    pub cc_switch: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -156,6 +160,20 @@ impl SkillManager {
                 disabled_root: Some(display(&disabled)),
                 skills,
             });
+        }
+        // 两个客户端里指向同一原件的技能互相标注。
+        let real_keys: Vec<Vec<String>> = locations
+            .iter()
+            .map(|l: &SkillLocation| l.skills.iter().map(real_key).collect())
+            .collect();
+        for (i, location) in locations.iter_mut().enumerate() {
+            let other = 1 - i;
+            let other_client = if other == 0 { SkillClient::Claude } else { SkillClient::Codex };
+            for (skill, key) in location.skills.iter_mut().zip(&real_keys[i]) {
+                if !skill.link_broken && real_keys[other].contains(key) {
+                    skill.shared_with.push(other_client);
+                }
+            }
         }
         for library in &self.libraries {
             let mut skills = scan_dir(library, true, false);
@@ -278,6 +296,40 @@ impl SkillManager {
         Ok(link)
     }
 
+    /// 把一个客户端里的技能同步到另一个客户端：在对方技能目录建目录联接，指向同一原件
+    /// （本身是联接时指向它的目标），文件只保存一份。
+    pub fn link_to_client(&self, path: &str, client: SkillClient) -> Result<PathBuf, String> {
+        let (real, placement) = self.locate(path)?;
+        let source_client = match placement.kind {
+            SkillLocationKind::Claude => SkillClient::Claude,
+            SkillLocationKind::Codex => SkillClient::Codex,
+            SkillLocationKind::Library => return Err("技能库中的技能请用挂载".into()),
+        };
+        if source_client == client {
+            return Err("技能已经在这个客户端中".into());
+        }
+        if placement.system {
+            return Err("Codex 内置技能随 Codex 更新，不能同步到其他客户端".into());
+        }
+        if !real.join(SKILL_FILE).is_file() {
+            return Err(format!("该技能没有 {}，不能同步", SKILL_FILE));
+        }
+        let name = file_name(Path::new(&crate::util::normalize_windows_path(path)))?;
+        let root = self.client_root(client);
+        for existing in [root.join(&name), self.disabled_root(client).join(&name)] {
+            if fs::symlink_metadata(&existing).is_ok() {
+                return Err(format!("{} 中已有同名技能：{}", match client {
+                    SkillClient::Claude => "Claude",
+                    SkillClient::Codex => "Codex",
+                }, existing.display()));
+            }
+        }
+        fs::create_dir_all(&root).map_err(|e| format!("无法创建技能目录 {}：{}", root.display(), e))?;
+        let link = root.join(&name);
+        create_junction(&link, &real)?;
+        Ok(link)
+    }
+
     /// 删除技能：联接只移除联接本身；真实文件夹移入回收站。
     pub fn delete(&self, path: &str) -> Result<SkillDeleteOutcome, String> {
         let target = PathBuf::from(crate::util::normalize_windows_path(path));
@@ -288,6 +340,21 @@ impl SkillManager {
         if is_reparse_point(&target) {
             remove_link(&target)?;
             return Ok(SkillDeleteOutcome::LinkRemoved);
+        }
+        // 另一个客户端的联接指向这个文件夹时，删除会让那边的技能失效。
+        let key = path_key(&target);
+        for client in [SkillClient::Claude, SkillClient::Codex] {
+            for root in [self.client_root(client), self.disabled_root(client)] {
+                let Ok(entries) = fs::read_dir(&root) else { continue };
+                for entry in entries.flatten() {
+                    let link = entry.path();
+                    if is_reparse_point(&link)
+                        && fs::read_link(&link).is_ok_and(|t| path_key(&t) == key)
+                    {
+                        return Err(format!("{} 链接着这个技能，请先取消同步或挂载", link.display()));
+                    }
+                }
+            }
         }
         move_to_recycle_bin(&target)?;
         Ok(SkillDeleteOutcome::Recycled)
@@ -384,9 +451,16 @@ fn scan_dir(root: &Path, enabled: bool, system: bool) -> Vec<SkillEntry> {
             total_bytes,
             modified_at,
             mounted_in: Vec::new(),
+            shared_with: Vec::new(),
+            cc_switch: None,
         });
     }
     skills
+}
+
+/// 技能原件的比较键：联接取目标。
+fn real_key(s: &SkillEntry) -> String {
+    path_key(Path::new(s.link_target.as_deref().unwrap_or(&s.path)))
 }
 
 fn sort_key(s: &SkillEntry) -> (bool, bool, String) {
@@ -744,5 +818,40 @@ mod tests {
         assert!(fs::symlink_metadata(&disabled).is_err());
         assert_eq!(fs::read_to_string(source.join("notes.txt")).unwrap(), "keep me");
         assert!(m.list()[2].skills[0].mounted_in.is_empty());
+    }
+
+    #[test]
+    fn link_to_other_client_shares_one_original() {
+        let t = TempDir::new();
+        let source = skill(&t.0.join("claude/skills"), "local", "---
+name: local
+description: L
+---
+");
+        let m = manager(&t, &[]);
+        let link = m.link_to_client(&source.to_string_lossy(), SkillClient::Codex).unwrap();
+        assert!(is_reparse_point(&link));
+        assert!(m.link_to_client(&source.to_string_lossy(), SkillClient::Codex).is_err());
+        assert!(m.link_to_client(&source.to_string_lossy(), SkillClient::Claude).is_err());
+        let locations = m.list();
+        assert_eq!(locations[0].skills[0].shared_with, vec![SkillClient::Codex]);
+        assert_eq!(locations[1].skills[0].shared_with, vec![SkillClient::Claude]);
+
+        // 还被链接着的原件不能删除；取消同步只移除联接。
+        assert!(m.delete(&source.to_string_lossy()).is_err());
+        assert_eq!(m.delete(&link.to_string_lossy()).unwrap(), SkillDeleteOutcome::LinkRemoved);
+        assert!(source.join(SKILL_FILE).is_file());
+
+        // 从联接再同步时指向原件，不会出现联接套联接。
+        let lib = t.0.join("lib");
+        let original = skill(&lib, "shared", "---
+name: shared
+---
+");
+        let m = manager(&t, &[&lib]);
+        let claude_link = m.mount(&original.to_string_lossy(), SkillClient::Claude).unwrap();
+        let codex_link = m.link_to_client(&claude_link.to_string_lossy(), SkillClient::Codex).unwrap();
+        assert_eq!(path_key(&fs::read_link(&codex_link).unwrap()), path_key(&original));
+        assert_eq!(m.list()[2].skills[0].mounted_in, vec![SkillClient::Claude, SkillClient::Codex]);
     }
 }

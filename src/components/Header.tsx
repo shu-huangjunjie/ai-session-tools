@@ -8,6 +8,7 @@ import {
   Sun,
   UploadCloud,
   Languages,
+  Plug,
   Puzzle,
   Terminal,
 } from 'lucide-react';
@@ -29,6 +30,7 @@ interface HeaderProps {
   onBackup: () => void;
   onOpenImport: () => void;
   onOpenSkills: () => void;
+  onOpenMcp: () => void;
   theme: 'dark' | 'light';
   onToggleTheme: () => void;
   onOpenClient?: (source: SourceCategory) => void;
@@ -47,6 +49,7 @@ export const Header: React.FC<HeaderProps> = ({
   onBackup,
   onOpenImport,
   onOpenSkills,
+  onOpenMcp,
   theme,
   onToggleTheme,
 }) => {
@@ -209,6 +212,16 @@ export const Header: React.FC<HeaderProps> = ({
           title={t.skills.buttonTooltip}
         >
           {t.skills.button}
+        </Button>
+
+        <Button
+          variant="ghost"
+          size="sm"
+          icon={<Plug size={13} className="text-[#86868b]" />}
+          onClick={onOpenMcp}
+          title={t.mcp.buttonTooltip}
+        >
+          {t.mcp.button}
         </Button>
 
         <Button
