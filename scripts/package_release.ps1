@@ -5,8 +5,8 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $version = (Get-Content -LiteralPath (Join-Path $projectRoot 'package.json') -Raw | ConvertFrom-Json).version
 $packageDir = Join-Path $projectRoot 'releases\packages'
-$portableName = "Context-Vault-$version-Windows-x64"
-$sourceName = "Context-Vault-$version-source"
+$portableName = "AI-Session-Tools-$version-Windows-x64"
+$sourceName = "AI-Session-Tools-$version-source"
 $portableStage = Join-Path $packageDir $portableName
 $portableZip = Join-Path $packageDir "$portableName.zip"
 $sourceZip = Join-Path $packageDir "$sourceName.zip"
@@ -29,7 +29,7 @@ Copy-Item -LiteralPath $releaseExe -Destination (Join-Path $portableStage 'Conte
 $loader = Join-Path $releaseRoot 'WebView2Loader.dll'
 if (Test-Path -LiteralPath $loader) { Copy-Item -LiteralPath $loader -Destination $portableStage }
 $instructions = @"
-Context Vault $version - Windows x64 便携版
+AI 会话工具 $version - Windows x64 便携版（Context Vault）
 
 使用方法
 1. 将整个压缩包解压到可写目录，双击 Context-Vault.exe。
@@ -42,6 +42,8 @@ Context Vault $version - Windows x64 便携版
 请保留原目录中的 data、backups 等文件夹。首次运行会自动备份并升级旧数据库。
 
 本版更新
+- 新增“技能”入口，可查看 Claude、Codex 的技能列表和 SKILL.md 全文。
+- 支持登记技能库、挂载与取消挂载、新建技能和启用/停用；Codex 内置技能只读。
 - 会话及工作文件夹支持分别置顶与取消置顶，重启后保留。
 - 清空数据库支持数量预览、确认和自动备份。
 - 批量保存支持带地址栏的目录选择窗口，并记住上次成功保存位置。

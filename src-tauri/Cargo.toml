@@ -1,6 +1,6 @@
 [package]
 name = "context-vault"
-version = "0.1.3"
+version = "0.1.4"
 description = "Windows 本地 Codex 会话恢复与整理工具 (TypeScript + Rust)"
 edition = "2021"
 

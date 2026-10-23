@@ -1,6 +1,6 @@
 {
   "name": "context-vault-app",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "AI 会话工具：本地管理、恢复、搜索与导出 Codex、Claude 和 Antigravity 会话",
   "private": true,
   "type": "module",

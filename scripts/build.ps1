@@ -35,6 +35,11 @@ if ($LASTEXITCODE -ne 0) { throw "Frontend build failed with exit code $LASTEXIT
 # 3. Build Tauri binary
 Write-Host "[3/3] 正在编译 Rust 后端与打包便携程序..." -ForegroundColor Yellow
 Set-Location "$ProjectRoot\src-tauri"
+$CargoTargetDir = if ($env:CARGO_TARGET_DIR) {
+    [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+} else {
+    Join-Path $ProjectRoot 'src-tauri\target'
+}
 # Only the MSVC toolchain links the WebView2 loader statically; MinGW builds load
 # WebView2Loader.dll at run time, so it has to be shipped next to the exe. Use the
 # MSVC toolchain whenever it and the Visual Studio C++ build tools are installed,
@@ -53,7 +58,7 @@ $RustHost = ((rustc @ToolchainArgs -vV | Select-String '^host:').ToString() -spl
 Set-Location $ProjectRoot
 $LoaderDll = $null
 if ($RustHost -notlike '*msvc') {
-    $LoaderDll = Get-ChildItem "$ProjectRoot\src-tauri\target\release\build\webview2-com-sys-*\out\x64\WebView2Loader.dll" |
+    $LoaderDll = Get-ChildItem "$CargoTargetDir\release\build\webview2-com-sys-*\out\x64\WebView2Loader.dll" |
         Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if (-not $LoaderDll) { throw "Missing WebView2Loader.dll for the $RustHost build" }
     Write-Host "    $RustHost 工具链：随程序附带 WebView2Loader.dll" -ForegroundColor Yellow
@@ -67,7 +72,7 @@ New-Item -ItemType Directory -Force -Path $DesktopOutDir | Out-Null
 # The C runtime is linked statically (src-tauri\.cargo\config.toml), and so is the
 # WebView2 loader in MSVC builds; then the exe is the only file the app needs besides
 # its data folder.
-$ReleaseExe = Join-Path $ProjectRoot "src-tauri\target\release\context-vault.exe"
+$ReleaseExe = Join-Path $CargoTargetDir 'release\context-vault.exe'
 
 if (Test-Path $ReleaseExe) {
     Copy-Item $ReleaseExe -Destination (Join-Path $OutDir "Context-Vault.exe") -Force

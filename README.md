@@ -2,7 +2,13 @@
 
 Windows 本地 AI 会话管理工具，支持 **Codex、Claude 和 Antigravity** 的会话恢复、搜索、置顶、备份与导出。基于 **Tauri v2 + React 18 + TypeScript + Rust** 构建。
 
-现有 0.1.3 桌面程序仍显示原名称 **Context Vault**，可执行文件为 `Context-Vault.exe`。
+桌面程序仍显示原名称 **Context Vault**，可执行文件为 `Context-Vault.exe`。
+
+## 直接下载使用（Windows x64）
+
+从 [GitHub Releases](https://github.com/shu-huangjunjie/ai-session-tools/releases/latest) 下载 `AI-Session-Tools-0.1.4-Windows-x64.zip`，解压到可写目录后双击 `Context-Vault.exe`。整个文件夹可以一起移动，`data/` 保存本地数据，`backups/` 保存备份。
+
+需要 Windows 10/11 和 Microsoft Edge WebView2 运行时。更新旧版时，先退出程序，只替换 `Context-Vault.exe`，保留自己的 `data/` 和 `backups/` 文件夹。
 
 ---
 

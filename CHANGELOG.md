@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.4 (2026-10-23)
 
 - Add skill management (header button "技能"). It lists the Claude (`~/.claude/skills`) and Codex (`$CODEX_HOME` or `~/.codex/skills`) skills with their SKILL.md name and description, previews SKILL.md, and opens a skill in Explorer or VS Code. Codex built-in skills under `.system` are shown read-only.
 - Register skill library folders (kept per user in the browser storage). Mount a library skill into Claude or Codex with a directory junction and unmount it again; the files stay only in the library. Library skills show where they are mounted and cannot be deleted while mounted.
