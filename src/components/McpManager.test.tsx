@@ -37,13 +37,20 @@ const locations = (): McpLocation[] => [
       server('codex', 'node_repl', { command: 'node', startup_timeout_sec: 120 }, { read_only: true }),
     ],
   },
+  {
+    client: 'antigravity', config_path: 'C:\\Users\\Demo\\.gemini\\config\\mcp_config.json', exists: true,
+    servers: [
+      server('antigravity', 'pencil', { command: 'pencil.exe', args: ['--mcp'] }),
+      server('antigravity', 'remote', { type: 'http', url: 'https://example.com/mcp' }, { enabled: false }),
+    ],
+  },
 ];
 
 const toast = vi.fn();
 const renderManager = () =>
   render(
     <I18nProvider>
-      <McpManager isOpen onClose={() => {}} onToast={toast} />
+      <McpManager onToast={toast} />
     </I18nProvider>
   );
 
@@ -60,43 +67,84 @@ beforeEach(() => {
 
 afterEach(cleanup);
 
-test('overview shows each server per client and copies a missing one across', async () => {
+const grid = () => within(screen.getByRole('grid'));
+const switchOf = (name: string) => screen.getByRole('switch', { name }) as HTMLButtonElement;
+const clickLastDelete = async (user: ReturnType<typeof userEvent.setup>) => {
+  const buttons = screen.getAllByRole('button', { name: 'Delete' });
+  await user.click(buttons[buttons.length - 1]);
+};
+
+test('every server is one row with a switch per client, and switching on adds it without any copy step', async () => {
   const user = userEvent.setup();
   renderManager();
-  const grid = await screen.findByRole('grid');
-  expect(within(grid).getByText('node_repl')).toBeTruthy();
-  // remote exists only in Claude: the Codex cell offers a copy.
-  await user.click(within(grid).getByRole('button', { name: 'Copy from Claude' }));
+  await screen.findByRole('switch', { name: 'Codex remote' });
+  expect(grid().getAllByText('pencil')).toHaveLength(1);
+  expect(screen.queryByRole('button', { name: /Copy/ })).toBeNull();
+  expect(switchOf('Codex remote').getAttribute('aria-checked')).toBe('false');
+
+  await user.click(switchOf('Codex remote'));
   expect(api.copyMcpServer).toHaveBeenCalledWith('claude', 'remote', 'codex', false);
-  await waitFor(() => expect(toast).toHaveBeenCalledWith('success', 'Copied remote to Codex'));
+  await waitFor(() => expect(toast).toHaveBeenCalledWith('success', 'Enabled remote in Codex'));
+
+  // node_repl belongs to the Codex desktop app: it is locked there and cannot be added elsewhere.
+  expect(switchOf('Codex node_repl').disabled).toBe(true);
+  expect(switchOf('Codex node_repl').getAttribute('aria-checked')).toBe('true');
+  expect(switchOf('Claude node_repl').disabled).toBe(true);
 });
 
-test('details mask secrets, toggle enabled state and confirm overwrites when copying', async () => {
+test('switches enable and disable existing entries, and the filter narrows the list', async () => {
   const user = userEvent.setup();
   renderManager();
-  await user.click(await screen.findByRole('button', { name: 'Claude remote' }));
+  await user.click(await screen.findByRole('switch', { name: 'Claude pencil' }));
+  expect(api.setMcpEnabled).toHaveBeenCalledWith('claude', 'pencil', false);
+  await waitFor(() => expect(toast).toHaveBeenCalledWith('success', 'Disabled pencil in Claude'));
+  await user.click(switchOf('Antigravity remote'));
+  expect(api.setMcpEnabled).toHaveBeenLastCalledWith('antigravity', 'remote', true);
+
+  await user.click(screen.getByRole('tab', { name: /^Not enabled/ }));
+  expect(grid().getByText('remote')).toBeTruthy();
+  expect(grid().queryByText('pencil')).toBeNull();
+});
+
+test('details mask secrets, show each client and note when the clients differ', async () => {
+  const user = userEvent.setup();
+  renderManager();
+  await user.click(await screen.findByText('remote', { selector: 'div' }));
   expect(screen.getByText(/Authorization: ••••••/)).toBeTruthy();
   expect(screen.queryByText(/Bearer secret/)).toBeNull();
   await user.click(screen.getByRole('button', { name: 'Show values' }));
   expect(screen.getByText(/Bearer secret/)).toBeTruthy();
-  await user.click(screen.getByRole('button', { name: 'Enable' }));
-  expect(api.setMcpEnabled).toHaveBeenCalledWith('claude', 'remote', true);
+  expect(screen.getByText('Not added')).toBeTruthy();
+  expect(screen.getByText(/configure this server differently; this shows Claude's/)).toBeTruthy();
 
-  await user.click(screen.getByRole('button', { name: 'Claude pencil' }));
+  await user.click(grid().getByText('pencil'));
   expect(screen.getAllByText(/cc-switch tracks this server/).length).toBeGreaterThan(0);
-  await user.click(screen.getByRole('button', { name: 'Copy to Codex' }));
-  expect(api.copyMcpServer).not.toHaveBeenCalled();
-  expect(screen.getByText(/already has a server with this name/)).toBeTruthy();
-  await user.click(screen.getByRole('button', { name: 'Replace' }));
-  expect(api.copyMcpServer).toHaveBeenCalledWith('claude', 'pencil', 'codex', true);
 });
 
-test('read-only Codex entries cannot be changed', async () => {
+test('editing saves to every client that has the server, and deleting removes it from all of them', async () => {
   const user = userEvent.setup();
   renderManager();
-  await user.click(await screen.findByRole('button', { name: /^Codex/ }));
-  await user.click(screen.getByText('node_repl'));
-  for (const name of ['Edit', 'Disable', 'Copy to Claude', 'Delete']) {
+  await user.click(await screen.findByText('pencil', { selector: 'div' }));
+  await user.click(screen.getByRole('button', { name: 'Edit' }));
+  await user.click(screen.getByRole('button', { name: 'Save' }));
+  const spec = { type: 'stdio', command: 'pencil.exe', args: ['--mcp'] };
+  await waitFor(() => expect(api.upsertMcpServer).toHaveBeenCalledTimes(3));
+  for (const client of ['claude', 'codex', 'antigravity']) {
+    expect(api.upsertMcpServer).toHaveBeenCalledWith(client, 'pencil', 'pencil', spec);
+  }
+
+  await user.click(screen.getByRole('button', { name: 'Delete' }));
+  expect(screen.getByText(/from the config of Claude、Codex、Antigravity/)).toBeTruthy();
+  await clickLastDelete(user);
+  await waitFor(() => expect(api.deleteMcpServer).toHaveBeenCalledTimes(3));
+  expect(vi.mocked(api.deleteMcpServer).mock.calls.map((c) => c[0])).toEqual(['claude', 'codex', 'antigravity']);
+});
+
+test('read-only Codex entries cannot be edited or deleted', async () => {
+  const user = userEvent.setup();
+  renderManager();
+  await user.click(await screen.findByText('node_repl', { selector: 'div' }));
+  for (const name of ['Edit', 'Delete']) {
     expect((screen.getByRole('button', { name }) as HTMLButtonElement).disabled).toBe(true);
   }
 });
@@ -132,8 +180,7 @@ test('editing keeps fields the form does not show and round-trips through JSON',
     { ...locations()[1], servers: [server('codex', 'tool', { command: 'tool.exe', startup_timeout_sec: 30 })] },
   ]);
   renderManager();
-  await user.click(await screen.findByRole('button', { name: /^Codex/ }));
-  await user.click(screen.getByText('tool'));
+  await user.click(await screen.findByText('tool', { selector: 'div' }));
   await user.click(screen.getByRole('button', { name: 'Edit' }));
   await user.click(screen.getByRole('button', { name: 'JSON' }));
   const json = screen.getAllByRole('textbox').find((el) => el.tagName === 'TEXTAREA') as HTMLTextAreaElement;
@@ -141,4 +188,38 @@ test('editing keeps fields the form does not show and round-trips through JSON',
   await user.click(screen.getByRole('button', { name: 'Save' }));
   await waitFor(() =>
     expect(api.upsertMcpServer).toHaveBeenCalledWith('codex', 'tool', 'tool', { type: 'stdio', command: 'tool.exe', startup_timeout_sec: 30 }));
+  expect(api.upsertMcpServer).toHaveBeenCalledTimes(1);
+});
+
+test('SSE servers cannot be switched on in Antigravity, which only speaks stdio and HTTP', async () => {
+  const user = userEvent.setup();
+  vi.mocked(api.listMcpServers).mockImplementation(async () => [
+    { ...locations()[0], servers: [server('claude', 'stream', { type: 'sse', url: 'https://example.com/sse' })] },
+    { ...locations()[1], servers: [] },
+    { ...locations()[2], servers: [] },
+  ]);
+  renderManager();
+  await screen.findByRole('switch', { name: 'Antigravity stream' });
+  expect(switchOf('Antigravity stream').disabled).toBe(true);
+  expect(switchOf('Antigravity stream').title).toMatch(/not SSE/);
+  await user.click(switchOf('Codex stream'));
+  expect(api.copyMcpServer).toHaveBeenCalledWith('claude', 'stream', 'codex', false);
+});
+
+
+test('enable all turns on every listed server that is off in that client', async () => {
+  const user = userEvent.setup();
+  vi.mocked(api.copyMcpServer).mockResolvedValue({ dropped_fields: ['headers'] });
+  renderManager();
+  await screen.findByRole('switch', { name: 'Codex remote' });
+  await user.click(screen.getByRole('button', { name: 'Enable all in Antigravity' }));
+  await waitFor(() => expect(api.setMcpEnabled).toHaveBeenCalledWith('antigravity', 'remote', true));
+  expect(api.setMcpEnabled).toHaveBeenCalledTimes(1);
+
+  await user.click(screen.getByRole('button', { name: 'Enable all in Codex' }));
+  await waitFor(() => expect(api.copyMcpServer).toHaveBeenCalledWith('claude', 'remote', 'codex', false));
+  expect(toast).toHaveBeenCalledWith('success', 'Enabled 1 servers in Codex');
+  expect(toast).toHaveBeenCalledWith('warning', expect.stringContaining('remote'));
+  // Claude still has remote switched off; read-only node_repl does not count.
+  expect(screen.getByRole('button', { name: 'Enable all in Claude' }).getAttribute('title')).toMatch(/the 1 listed servers/);
 });

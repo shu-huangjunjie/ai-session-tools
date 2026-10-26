@@ -1,34 +1,35 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, Copy, Eye, EyeOff, FileCode2, Lock, Pencil, Plus, Power, RefreshCw, Search, Trash2 } from 'lucide-react';
+import { AlertTriangle, Eye, EyeOff, FileCode2, Lock, Pencil, Plus, RefreshCw, Search, Trash2 } from 'lucide-react';
 import { api, errorMessage } from '../api/client';
 import { McpClient, McpLocation, McpServerEntry, McpSpec } from '../types';
 import { Badge } from './common/Badge';
 import { Button } from './common/Button';
-import { Modal } from './common/Modal';
+import { PageHeader } from './common/PageHeader';
+import { Segmented } from './common/Segmented';
+import { Switch } from './common/Switch';
 import { useI18n } from '../i18n';
 
 type ToastType = 'success' | 'warning' | 'error' | 'info';
-type Tab = 'overview' | McpClient;
+type Filter = 'all' | McpClient | 'off';
 
 interface McpManagerProps {
-  isOpen: boolean;
-  onClose: () => void;
   onToast: (type: ToastType, message: string) => void;
 }
 
-const CLIENTS: McpClient[] = ['claude', 'codex'];
-const CLIENT_LABEL: Record<McpClient, string> = { claude: 'Claude', codex: 'Codex' };
+const CLIENTS: McpClient[] = ['claude', 'codex', 'antigravity'];
+const CLIENT_LABEL: Record<McpClient, string> = { claude: 'Claude', codex: 'Codex', antigravity: 'Antigravity' };
 const NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 /** Fields the form edits; everything else in a spec is kept as is. */
 const CORE_FIELDS = ['type', 'command', 'args', 'env', 'url', 'headers'];
 
-const otherClient = (client: McpClient): McpClient => (client === 'claude' ? 'codex' : 'claude');
 const asStrings = (value: unknown): string[] => (Array.isArray(value) ? value.map(String) : []);
 const asStringMap = (value: unknown): Record<string, string> =>
   value && typeof value === 'object' && !Array.isArray(value)
     ? Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, String(v)]))
     : {};
 const extraFields = (spec: McpSpec) => Object.fromEntries(Object.entries(spec).filter(([k]) => !CORE_FIELDS.includes(k)));
+/** The part of a spec every client shares, for telling whether two clients run the same server. */
+const coreOf = (spec: McpSpec) => JSON.stringify(CORE_FIELDS.map((k) => spec[k] ?? null));
 
 /** One line per server: the command line for stdio, the URL otherwise. */
 export function serverSummary(entry: McpServerEntry): string {
@@ -36,20 +37,30 @@ export function serverSummary(entry: McpServerEntry): string {
   return String(entry.spec.url ?? '');
 }
 
+/** One server name across clients, like a skill row: each client's entry, if it has one. */
+interface McpGroup {
+  key: string;
+  name: string;
+  entries: Partial<Record<McpClient, McpServerEntry>>;
+  /** The entry the details show: the first client that has it. */
+  primary: McpServerEntry;
+}
+
 const inputClass =
   'w-full bg-black/[0.04] dark:bg-white/[0.06] px-3 py-2 rounded-xl border border-black/[0.08] dark:border-white/[0.08] focus:border-[#0071e3] focus:outline-none placeholder-[#86868b]';
 
-export const McpManager: React.FC<McpManagerProps> = ({ isOpen, onClose, onToast }) => {
+/** One list of every server with a switch per client, like the skills page; nothing to copy by hand. */
+export const McpManager: React.FC<McpManagerProps> = ({ onToast }) => {
   const { t, interpolate } = useI18n();
   const m = t.mcp;
   const [locations, setLocations] = useState<McpLocation[]>([]);
-  const [tab, setTab] = useState<Tab>('overview');
-  const [selected, setSelected] = useState<{ client: McpClient; name: string } | null>(null);
+  const [filter, setFilter] = useState<Filter>('all');
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [editing, setEditing] = useState<{ entry?: McpServerEntry } | null>(null);
-  const [confirm, setConfirm] = useState<'delete' | 'overwrite' | null>(null);
+  const [editing, setEditing] = useState<{ group?: McpGroup } | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const [reveal, setReveal] = useState(false);
   const [showRaw, setShowRaw] = useState(false);
 
@@ -67,40 +78,68 @@ export const McpManager: React.FC<McpManagerProps> = ({ isOpen, onClose, onToast
   }, [fail]);
 
   useEffect(() => {
-    if (isOpen) {
-      setQuery('');
-      setEditing(null);
-      setConfirm(null);
-      void refresh();
-    }
-    // Reload only when the dialog opens; actions refresh explicitly.
+    void refresh();
+    // Reload only when the page opens; actions refresh explicitly.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOpen]);
+  }, []);
 
   useEffect(() => {
-    setConfirm(null);
+    setConfirmDelete(false);
     setReveal(false);
     setShowRaw(false);
-  }, [selected?.client, selected?.name]);
+  }, [selectedKey]);
 
   const location = (client: McpClient) => locations.find((l) => l.client === client);
-  const find = (client: McpClient, name: string) => location(client)?.servers.find((s) => s.name === name);
-  const entry = selected ? find(selected.client, selected.name) ?? null : null;
+  const writable = (server: McpServerEntry) => !server.read_only && !location(server.client)?.error;
 
-  const matches = useCallback(
-    (s: McpServerEntry) => {
-      const q = query.trim().toLowerCase();
-      return !q || [s.name, serverSummary(s)].some((v) => v.toLowerCase().includes(q));
-    },
-    [query]
-  );
+  const groups = useMemo(() => {
+    const byKey = new Map<string, McpGroup>();
+    for (const l of locations) {
+      for (const server of l.servers) {
+        const key = server.name.toLowerCase();
+        const group = byKey.get(key) ?? { key, name: server.name, entries: {}, primary: server };
+        group.entries[server.client] ??= server;
+        byKey.set(key, group);
+      }
+    }
+    for (const group of byKey.values()) group.primary = CLIENTS.map((c) => group.entries[c]).find(Boolean)!;
+    return [...byKey.values()].sort((a, b) => a.key.localeCompare(b.key));
+  }, [locations]);
 
-  // Overview rows: every server name in either client.
-  const overviewNames = useMemo(() => {
-    const names = new Map<string, string>();
-    for (const l of locations) for (const s of l.servers) if (matches(s)) names.set(s.name.toLowerCase(), s.name);
-    return [...names.values()].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
-  }, [locations, matches]);
+  const isOn = (g: McpGroup, client: McpClient) => Boolean(g.entries[client]?.enabled);
+  const isOff = (g: McpGroup) => !CLIENTS.some((c) => isOn(g, c));
+  const counts = {
+    all: groups.length,
+    off: groups.filter(isOff).length,
+    ...Object.fromEntries(CLIENTS.map((c) => [c, groups.filter((g) => isOn(g, c)).length])),
+  } as Record<Filter, number>;
+  const visibleGroups = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return groups.filter(
+      (g) =>
+        (filter === 'all' || (filter === 'off' ? isOff(g) : isOn(g, filter))) &&
+        (!q || Object.values(g.entries).some((s) => [s!.name, serverSummary(s!)].some((v) => v.toLowerCase().includes(q))))
+    );
+    // isOn and isOff only read the group.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groups, filter, query]);
+  const selected = groups.find((g) => g.key === selectedKey) ?? null;
+
+  /** Where switching a client on takes the server from: an enabled, writable copy first. */
+  const sourceFor = (g: McpGroup, client: McpClient) => {
+    const candidates = CLIENTS.filter((c) => c !== client)
+      .map((c) => g.entries[c])
+      .filter((s): s is McpServerEntry => Boolean(s) && writable(s!) && !(client === 'antigravity' && s!.transport === 'sse'));
+    return candidates.find((s) => s.enabled) ?? candidates[0];
+  };
+  const canToggle = (g: McpGroup, client: McpClient) => {
+    if (location(client)?.error) return false;
+    const entry = g.entries[client];
+    return entry ? writable(entry) : Boolean(sourceFor(g, client));
+  };
+  /** The writable entries that editing and deleting act on. */
+  const writableEntries = (g: McpGroup) =>
+    CLIENTS.map((c) => g.entries[c]).filter((s): s is McpServerEntry => Boolean(s) && writable(s!));
 
   const run = async (action: () => Promise<void>) => {
     setBusy(true);
@@ -113,366 +152,381 @@ export const McpManager: React.FC<McpManagerProps> = ({ isOpen, onClose, onToast
     }
   };
 
-  const toggleEnabled = (server: McpServerEntry) =>
-    run(async () => {
-      await api.setMcpEnabled(server.client, server.name, !server.enabled);
-      onToast('success', interpolate(server.enabled ? m.toastDisabled : m.toastEnabled, { name: server.name }));
-      await refresh();
-    });
+  /** Turns a server on in a client: enables its entry, or writes it in from another client. Returns dropped fields. */
+  const switchOn = async (g: McpGroup, client: McpClient): Promise<string[]> => {
+    const entry = g.entries[client];
+    if (entry) {
+      await api.setMcpEnabled(client, entry.name, true);
+      return [];
+    }
+    const source = sourceFor(g, client);
+    if (!source) return [];
+    return (await api.copyMcpServer(source.client, source.name, client, false)).dropped_fields;
+  };
 
-  const copyTo = (server: McpServerEntry, overwrite: boolean) =>
+  /** Off disables the client's entry; on enables it, or writes the server into a client that lacks it. */
+  const toggleClient = (g: McpGroup, client: McpClient) =>
     run(async () => {
-      const to = otherClient(server.client);
-      const outcome = await api.copyMcpServer(server.client, server.name, to, overwrite);
-      setConfirm(null);
-      if (outcome.dropped_fields.length > 0) {
-        onToast('warning', interpolate(m.toastDropped, { name: server.name, client: CLIENT_LABEL[to], fields: outcome.dropped_fields.join(', ') }));
+      const entry = g.entries[client];
+      const vars = { name: g.name, client: CLIENT_LABEL[client] };
+      if (entry?.enabled) {
+        await api.setMcpEnabled(client, entry.name, false);
+        onToast('success', interpolate(m.toastDisabledIn, vars));
       } else {
-        onToast('success', interpolate(m.toastCopied, { name: server.name, client: CLIENT_LABEL[to] }));
+        const dropped = await switchOn(g, client);
+        if (dropped.length > 0) {
+          onToast('warning', interpolate(m.toastEnabledDropped, { ...vars, fields: dropped.join(', ') }));
+        } else {
+          onToast('success', interpolate(m.toastEnabledIn, vars));
+        }
       }
       await refresh();
     });
 
-  const requestCopy = (server: McpServerEntry) => {
-    const existing = find(otherClient(server.client), server.name);
-    // A disabled entry of the same name is refused by the backend with an explanation.
-    if (existing?.enabled) setConfirm('overwrite');
-    else void copyTo(server, false);
-  };
+  /** The listed servers a client could run but does not; enable-all acts on these. */
+  const offIn = (client: McpClient) => visibleGroups.filter((g) => !isOn(g, client) && canToggle(g, client));
 
-  const deleteServer = (server: McpServerEntry) =>
+  const enableAll = (client: McpClient) =>
     run(async () => {
-      await api.deleteMcpServer(server.client, server.name);
-      onToast('success', interpolate(m.toastDeleted, { name: server.name }));
-      setSelected(null);
+      const failed: string[] = [];
+      const trimmed: string[] = [];
+      let done = 0;
+      for (const g of offIn(client)) {
+        try {
+          if ((await switchOn(g, client)).length > 0) trimmed.push(g.name);
+          done += 1;
+        } catch {
+          failed.push(g.name);
+        }
+      }
+      const vars = { client: CLIENT_LABEL[client] };
+      if (done > 0) onToast('success', interpolate(m.toastEnabledAll, { ...vars, count: done }));
+      if (trimmed.length > 0) onToast('warning', interpolate(m.toastDroppedSome, { ...vars, names: trimmed.join('、') }));
+      if (failed.length > 0) onToast('warning', interpolate(m.toastEnableAllFailed, { count: failed.length, names: failed.join('、') }));
       await refresh();
     });
 
+  /** Saves to every chosen client; an edit updates each client that has the server, keeping its switch. */
   const save = (clients: McpClient[], name: string, spec: McpSpec) =>
     run(async () => {
-      const original = editing?.entry?.name ?? null;
+      const group = editing?.group;
       for (const client of clients) {
-        await api.upsertMcpServer(client, original, name, spec);
+        await api.upsertMcpServer(client, group?.entries[client]?.name ?? null, name, spec);
       }
-      onToast('success', interpolate(original ? m.toastSaved : m.toastCreated, { name }));
+      onToast('success', interpolate(group ? m.toastSaved : m.toastCreated, { name }));
       setEditing(null);
       await refresh();
-      setSelected({ client: clients[0], name });
-      if (tab !== 'overview') setTab(clients[0]);
+      setSelectedKey(name.toLowerCase());
     });
 
-  const select = (client: McpClient, name: string) => {
-    setSelected({ client, name });
-    setEditing(null);
+  const deleteGroup = (g: McpGroup) =>
+    run(async () => {
+      for (const server of writableEntries(g)) await api.deleteMcpServer(server.client, server.name);
+      onToast('success', interpolate(m.toastDeleted, { name: g.name }));
+      setSelectedKey(null);
+      await refresh();
+    });
+
+  const stateLabel = (g: McpGroup, client: McpClient) => {
+    const entry = g.entries[client];
+    if (!entry) return m.stateNone;
+    return entry.enabled ? m.enabledState : m.disabled;
+  };
+  const disableTooltip: Record<McpClient, string> = {
+    claude: m.disableTooltipClaude,
+    codex: m.disableTooltipCodex,
+    antigravity: m.disableTooltipAntigravity,
+  };
+  const switchTitle = (g: McpGroup, client: McpClient) => {
+    const entry = g.entries[client];
+    if (entry) return entry.enabled ? disableTooltip[client] : m.enableTooltip;
+    if (client === 'antigravity' && Object.values(g.entries).every((s) => s!.transport === 'sse')) return m.sseUnsupported;
+    return m.addTooltip;
   };
 
-  const activeLocation = tab === 'overview' ? undefined : location(tab);
-  const writable = (server: McpServerEntry) => !server.read_only && !location(server.client)?.error;
-
-  const badges = (server: McpServerEntry) => (
-    <>
-      {!server.enabled && <Badge tone="gray">{m.disabled}</Badge>}
-      {server.read_only && <Badge tone="purple"><Lock size={9} />{m.readOnly}</Badge>}
-      {server.cc_switch != null && <Badge tone="orange" title={m.ccSwitchHint}>{m.ccSwitch}</Badge>}
-    </>
-  );
-
   return (
-    <Modal isOpen={isOpen} onClose={onClose} title={m.title} subtitle={m.subtitle} widthClass="max-w-6xl">
-      <div className="flex flex-col gap-3 h-[68vh] text-xs select-text">
-        <div className="flex items-center gap-2 flex-wrap">
-          <div className="flex items-center bg-black/[0.04] dark:bg-white/[0.06] p-1 rounded-full border border-black/[0.08] dark:border-white/[0.1] gap-1">
-            {(['overview', ...CLIENTS] as Tab[]).map((key) => (
-              <button
-                key={key}
-                onClick={() => setTab(key)}
-                className={`flex items-center gap-1.5 px-3 py-1 rounded-full transition-all ${
-                  tab === key
-                    ? 'bg-white dark:bg-[#1c1c1e] text-[#0071e3] dark:text-[#2997ff] shadow-sm font-semibold'
-                    : 'text-[#86868b] hover:text-[#1d1d1f] dark:hover:text-white'
-                }`}
-              >
-                {key === 'overview' ? m.overview : CLIENT_LABEL[key]}
-                {key !== 'overview' && <span className="text-[10px] font-mono opacity-70">{location(key)?.servers.length ?? 0}</span>}
-              </button>
-            ))}
-          </div>
-          <div className="flex-1" />
-          <div className="relative">
-            <Search size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#86868b]" />
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder={m.search}
-              className="w-56 bg-black/[0.04] dark:bg-white/[0.06] pl-8 pr-3 py-1.5 rounded-full border border-black/[0.08] dark:border-white/[0.08] focus:border-[#0071e3] focus:outline-none placeholder-[#86868b]"
-            />
-          </div>
-          <Button size="sm" variant="ghost" onClick={() => refresh()} disabled={loading} icon={<RefreshCw size={13} className={loading ? 'animate-spin' : ''} />}>
-            {m.refresh}
-          </Button>
-          <Button
-            size="sm"
-            variant="primary"
-            icon={<Plus size={13} />}
-            onClick={() => {
-              setEditing({});
-              setSelected(null);
-            }}
-          >
-            {m.newServer}
-          </Button>
+    <div className="flex-1 flex flex-col min-h-0 text-xs">
+      <PageHeader
+        title={m.button}
+        tabs={
+          <Segmented
+            value={filter}
+            onChange={setFilter}
+            items={[
+              { key: 'all' as Filter, label: m.overview, count: counts.all },
+              ...CLIENTS.map((client) => ({ key: client as Filter, label: CLIENT_LABEL[client], count: counts[client] })),
+              { key: 'off' as Filter, label: m.filterOff, count: counts.off },
+            ]}
+          />
+        }
+      >
+        <div className="relative">
+          <Search size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#86868b]" />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder={m.search}
+            className="w-56 bg-black/[0.045] dark:bg-white/[0.07] pl-8 pr-3 py-1.5 rounded-lg border border-transparent focus:border-[#0071e3] focus:outline-none placeholder-[#86868b]"
+          />
         </div>
+        <Button
+          variant="primary"
+          icon={<Plus size={13} />}
+          onClick={() => {
+            setEditing({});
+            setSelectedKey(null);
+          }}
+        >
+          {m.newServer}
+        </Button>
+        <Button
+          variant="ghost"
+          onClick={() => refresh()}
+          disabled={loading}
+          title={m.refresh}
+          aria-label={m.refresh}
+          className="px-2"
+          icon={<RefreshCw size={14} className={loading ? 'animate-spin' : ''} />}
+        />
+      </PageHeader>
 
-        <div className="flex items-center gap-2 text-[11px] text-[#86868b] min-h-[18px]">
-          {(activeLocation ? [activeLocation] : locations).map((l) => (
-            <span key={l.client} className="flex items-center gap-1.5 min-w-0">
-              {!activeLocation && <span className="font-semibold">{CLIENT_LABEL[l.client]}</span>}
-              <span className="font-mono truncate" title={l.config_path}>{l.config_path}</span>
-              {!l.exists && <Badge tone="orange"><AlertTriangle size={10} />{m.configMissing}</Badge>}
-              {l.error && <Badge tone="red" title={l.error}><AlertTriangle size={10} />{interpolate(m.configError, { error: l.error })}</Badge>}
-            </span>
-          ))}
-          <span className="ml-auto shrink-0">{m.sessionHint}</span>
-        </div>
-
-        <div className="flex gap-3 flex-1 min-h-0">
-          {/* Server list or overview matrix */}
-          <div className="w-[46%] overflow-y-auto pr-1">
-            {tab === 'overview' ? (
-              <table className="w-full border-separate border-spacing-y-1" role="grid">
-                <thead>
-                  <tr className="text-[11px] text-[#86868b]">
-                    <th className="text-left font-semibold px-3">{m.name}</th>
-                    {CLIENTS.map((c) => (
-                      <th key={c} className="text-left font-semibold px-2 w-[34%]">{CLIENT_LABEL[c]}</th>
+      <div className="flex-1 flex min-h-0">
+        <div className="flex-1 min-w-0 flex flex-col bg-white dark:bg-[#121214] border-r border-black/[0.06] dark:border-white/[0.08]">
+          <div className="flex-1 overflow-y-auto">
+            <table className="w-full border-separate border-spacing-0" role="grid">
+              <thead>
+                <tr className="text-[11px] text-[#86868b]">
+                  <th className="sticky top-0 z-10 bg-white dark:bg-[#121214] text-left font-medium px-4 py-2.5 border-b border-black/[0.06] dark:border-white/[0.08]">{m.name}</th>
+                  {CLIENTS.map((c) => (
+                    <th key={c} className="sticky top-0 z-10 bg-white dark:bg-[#121214] text-left font-medium px-4 py-2 w-[120px] border-b border-black/[0.06] dark:border-white/[0.08]">
+                      <div className="flex flex-col items-start gap-0.5">
+                        <span>{CLIENT_LABEL[c]}</span>
+                        <button
+                          type="button"
+                          onClick={() => enableAll(c)}
+                          disabled={busy || offIn(c).length === 0}
+                          title={interpolate(m.enableAllTooltip, { client: CLIENT_LABEL[c], count: offIn(c).length })}
+                          aria-label={interpolate(m.enableAllIn, { client: CLIENT_LABEL[c] })}
+                          className="text-[11px] font-normal text-[#0071e3] dark:text-[#2997ff] hover:underline disabled:text-[#86868b] disabled:opacity-50 disabled:no-underline disabled:cursor-default"
+                        >
+                          {m.enableAll}
+                        </button>
+                      </div>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {visibleGroups.length === 0 && (
+                  <tr>
+                    <td colSpan={CLIENTS.length + 1} className="text-center text-[#86868b] py-10">{query ? m.noMatch : m.empty}</td>
+                  </tr>
+                )}
+                {visibleGroups.map((g) => (
+                  <tr
+                    key={g.key}
+                    className={selected?.key === g.key ? 'bg-[#0071e3]/[0.05] dark:bg-[#2997ff]/10' : 'hover:bg-black/[0.02] dark:hover:bg-white/[0.03]'}
+                  >
+                    <td className="px-4 py-2.5 border-b border-black/[0.05] dark:border-white/[0.06] max-w-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedKey(g.key);
+                          setEditing(null);
+                        }}
+                        className="text-left w-full min-w-0"
+                      >
+                        <div className={`font-semibold text-[13px] text-[#1d1d1f] dark:text-white ${isOff(g) ? 'opacity-60' : ''}`}>{g.name}</div>
+                        <div className="mt-0.5 font-mono text-[11px] text-[#86868b] truncate" title={serverSummary(g.primary)}>
+                          {serverSummary(g.primary)}
+                        </div>
+                      </button>
+                    </td>
+                    {CLIENTS.map((client) => (
+                      <td key={client} className="px-4 py-2.5 border-b border-black/[0.05] dark:border-white/[0.06]">
+                        <div className="flex items-center gap-1.5">
+                          <Switch
+                            checked={isOn(g, client)}
+                            disabled={busy || !canToggle(g, client)}
+                            label={`${CLIENT_LABEL[client]} ${g.name}`}
+                            title={switchTitle(g, client)}
+                            onChange={() => toggleClient(g, client)}
+                          />
+                          {g.entries[client]?.read_only && <Lock size={11} className="text-[#af52de]" aria-label={m.readOnly} />}
+                        </div>
+                      </td>
                     ))}
                   </tr>
-                </thead>
-                <tbody>
-                  {overviewNames.length === 0 && (
-                    <tr>
-                      <td colSpan={3} className="text-center text-[#86868b] py-10">{query ? m.noMatch : m.empty}</td>
-                    </tr>
-                  )}
-                  {overviewNames.map((name) => (
-                    <tr key={name}>
-                      <td className="px-3 py-2 rounded-l-xl bg-black/[0.02] dark:bg-white/[0.03] font-semibold text-[#1d1d1f] dark:text-white break-all">{name}</td>
-                      {CLIENTS.map((client, i) => {
-                        const server = find(client, name);
-                        const source = find(otherClient(client), name);
-                        const active = selected?.client === client && selected.name === name;
-                        return (
-                          <td key={client} className={`px-2 py-1.5 bg-black/[0.02] dark:bg-white/[0.03] ${i === CLIENTS.length - 1 ? 'rounded-r-xl' : ''}`}>
-                            {server ? (
-                              <button
-                                onClick={() => select(client, name)}
-                                aria-label={`${CLIENT_LABEL[client]} ${name}`}
-                                className={`w-full text-left px-2 py-1 rounded-lg border transition-all flex items-center gap-1 flex-wrap ${
-                                  active ? 'border-[#0071e3]/50 bg-[#0071e3]/[0.06]' : 'border-transparent hover:bg-black/[0.04] dark:hover:bg-white/[0.06]'
-                                }`}
-                              >
-                                <Badge tone={server.enabled ? 'green' : 'gray'}>{server.enabled ? m.enable : m.disabled}</Badge>
-                                {server.read_only && <Lock size={10} className="text-[#af52de]" />}
-                                {server.cc_switch != null && <Badge tone="orange" title={m.ccSwitchHint}>cc</Badge>}
-                              </button>
-                            ) : source && writable(source) && !location(client)?.error ? (
-                              <Button size="sm" variant="link" disabled={busy} title={m.copyHint} onClick={() => copyTo(source, false)}>
-                                {interpolate(m.copyHere, { client: CLIENT_LABEL[source.client] })}
-                              </Button>
-                            ) : (
-                              <span className="px-2 text-[#86868b]">{m.notConfigured}</span>
-                            )}
-                          </td>
-                        );
-                      })}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            ) : (
-              <div className="space-y-1.5" role="list">
-                {(activeLocation?.servers.filter(matches) ?? []).length === 0 && (
-                  <div className="text-center text-[#86868b] py-10">{query ? m.noMatch : m.empty}</div>
-                )}
-                {activeLocation?.servers.filter(matches).map((server) => {
-                  const active = selected?.client === server.client && selected.name === server.name;
-                  return (
-                    <button
-                      key={`${server.name}:${server.enabled}`}
-                      role="listitem"
-                      onClick={() => select(server.client, server.name)}
-                      className={`w-full text-left p-3 rounded-2xl border transition-all ${
-                        active
-                          ? 'border-[#0071e3]/50 bg-[#0071e3]/[0.06] dark:bg-[#2997ff]/10'
-                          : 'border-black/[0.06] dark:border-white/[0.08] hover:bg-black/[0.03] dark:hover:bg-white/[0.04]'
-                      } ${server.enabled ? '' : 'opacity-60'}`}
-                    >
-                      <div className="flex items-center gap-1.5 flex-wrap">
-                        <span className="font-semibold text-[#1d1d1f] dark:text-white">{server.name}</span>
-                        <Badge tone="blue">{server.transport}</Badge>
-                        {badges(server)}
-                      </div>
-                      <p className="mt-1 text-[11px] font-mono text-[#6e6e73] dark:text-[#a1a1a6] truncate">{serverSummary(server)}</p>
-                    </button>
-                  );
-                })}
-              </div>
-            )}
+                ))}
+              </tbody>
+            </table>
           </div>
-
-          {/* Detail or form */}
-          <div className="flex-1 min-w-0 overflow-y-auto rounded-2xl border border-black/[0.06] dark:border-white/[0.08] bg-black/[0.015] dark:bg-white/[0.02] p-4">
-            {editing ? (
-              <McpServerForm
-                key={editing.entry ? `${editing.entry.client}:${editing.entry.name}` : 'new'}
-                entry={editing.entry}
-                defaultClients={tab === 'overview' ? ['claude'] : [tab]}
-                lockedClients={locations.filter((l) => l.error).map((l) => l.client)}
-                busy={busy}
-                onCancel={() => setEditing(null)}
-                onSubmit={save}
-              />
-            ) : !entry ? (
-              <div className="h-full flex items-center justify-center text-[#86868b]">{m.selectHint}</div>
-            ) : (
-              <div className="flex flex-col gap-3">
-                <div className="flex items-center gap-1.5 flex-wrap">
-                  <h4 className="text-sm font-semibold text-[#1d1d1f] dark:text-white mr-1">{entry.name}</h4>
-                  <Badge tone="blue">{CLIENT_LABEL[entry.client]}</Badge>
-                  {badges(entry)}
-                </div>
-
-                <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1.5 text-[11px]">
-                  <dt className="text-[#86868b]">{m.configFile}</dt>
-                  <dd className="font-mono break-all">{location(entry.client)?.config_path}</dd>
-                  <dt className="text-[#86868b]">{m.transport}</dt>
-                  <dd className="font-mono">{entry.transport}</dd>
-                  {entry.transport === 'stdio' ? (
-                    <>
-                      <dt className="text-[#86868b]">{m.command}</dt>
-                      <dd className="font-mono break-all">{String(entry.spec.command ?? '')}</dd>
-                      {asStrings(entry.spec.args).length > 0 && (
-                        <>
-                          <dt className="text-[#86868b]">{m.args}</dt>
-                          <dd className="font-mono break-all">{asStrings(entry.spec.args).map((a, i) => <div key={i}>{a}</div>)}</dd>
-                        </>
-                      )}
-                    </>
-                  ) : (
-                    <>
-                      <dt className="text-[#86868b]">{m.url}</dt>
-                      <dd className="font-mono break-all">{String(entry.spec.url ?? '')}</dd>
-                    </>
-                  )}
-                  {(['env', 'headers'] as const).map((field) => {
-                    const values = Object.entries(asStringMap(entry.spec[field]));
-                    if (values.length === 0) return null;
-                    return (
-                      <React.Fragment key={field}>
-                        <dt className="text-[#86868b]">{field === 'env' ? m.env : m.headers}</dt>
-                        <dd className="font-mono break-all">
-                          {values.map(([k, v]) => (
-                            <div key={k}>
-                              {k}
-                              {field === 'env' ? '=' : ': '}
-                              {reveal ? v : v ? '••••••' : ''}
-                            </div>
-                          ))}
-                        </dd>
-                      </React.Fragment>
-                    );
-                  })}
-                  {Object.keys(extraFields(entry.spec)).length > 0 && (
-                    <>
-                      <dt className="text-[#86868b]">{m.otherFields}</dt>
-                      <dd className="font-mono break-all whitespace-pre-wrap">
-                        {reveal
-                          ? JSON.stringify(extraFields(entry.spec), null, 1)
-                          : Object.keys(extraFields(entry.spec)).join(', ')}
-                      </dd>
-                    </>
-                  )}
-                </dl>
-
-                <div className="flex items-center gap-2 flex-wrap">
-                  <Button size="sm" variant="secondary" icon={<Pencil size={13} />} disabled={busy || !writable(entry)} onClick={() => setEditing({ entry })}>
-                    {m.edit}
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    icon={<Power size={13} />}
-                    disabled={busy || !writable(entry)}
-                    title={entry.enabled ? (entry.client === 'claude' ? m.disableTooltipClaude : m.disableTooltipCodex) : m.enableTooltip}
-                    onClick={() => toggleEnabled(entry)}
-                  >
-                    {entry.enabled ? m.disable : m.enable}
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    icon={<Copy size={13} />}
-                    disabled={busy || !writable(entry) || Boolean(location(otherClient(entry.client))?.error)}
-                    title={m.copyHint}
-                    onClick={() => requestCopy(entry)}
-                  >
-                    {interpolate(m.copyTo, { client: CLIENT_LABEL[otherClient(entry.client)] })}
-                  </Button>
-                  <Button size="sm" variant="danger" icon={<Trash2 size={13} />} disabled={busy || !writable(entry)} onClick={() => setConfirm('delete')}>
-                    {m.delete}
-                  </Button>
-                  <div className="flex-1" />
-                  <Button size="sm" variant="ghost" icon={reveal ? <EyeOff size={13} /> : <Eye size={13} />} onClick={() => setReveal((v) => !v)}>
-                    {reveal ? m.hideValues : m.showValues}
-                  </Button>
-                  <Button size="sm" variant="ghost" icon={<FileCode2 size={13} />} onClick={() => setShowRaw((v) => !v)}>
-                    {m.raw}
-                  </Button>
-                </div>
-
-                {entry.cc_switch != null && (
-                  <p className="flex items-start gap-1.5 text-[11px] text-[#c93400] dark:text-[#ff9f0a] leading-relaxed">
-                    <AlertTriangle size={12} className="mt-0.5 shrink-0" />
-                    {m.ccSwitchHint}
-                  </p>
-                )}
-
-                {confirm && (
-                  <div className="p-3 rounded-2xl border border-[#ff453a]/25 bg-[#ff453a]/[0.06] flex items-center gap-3">
-                    <p className="flex-1 leading-relaxed">
-                      {confirm === 'delete' ? m.deleteConfirm : interpolate(m.overwriteConfirm, { client: CLIENT_LABEL[otherClient(entry.client)] })}
-                    </p>
-                    <Button size="sm" variant="ghost" onClick={() => setConfirm(null)}>
-                      {t.common.cancel}
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="danger"
-                      disabled={busy}
-                      onClick={() => (confirm === 'delete' ? deleteServer(entry) : copyTo(entry, true))}
-                    >
-                      {confirm === 'delete' ? m.confirmDelete : m.overwrite}
-                    </Button>
-                  </div>
-                )}
-
-                {showRaw && (
-                  <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed p-3 rounded-xl bg-black/[0.04] dark:bg-black/40 border border-black/[0.06] dark:border-white/[0.06] max-h-[40vh] overflow-y-auto">
-                    {entry.raw}
-                  </pre>
-                )}
+          <div className="px-4 py-2.5 border-t border-black/[0.06] dark:border-white/[0.08] text-[11px] text-[#86868b] flex flex-col gap-1">
+            {locations.map((l) => (
+              <div key={l.client} className="flex items-center gap-1.5 min-w-0">
+                <span className="font-semibold shrink-0">{CLIENT_LABEL[l.client]}</span>
+                <span className="font-mono truncate" title={l.config_path}>{l.config_path}</span>
+                {l.error && <Badge tone="red" title={l.error}><AlertTriangle size={10} />{interpolate(m.configError, { error: l.error })}</Badge>}
               </div>
-            )}
+            ))}
+            <span>{m.unifiedHint}</span>
           </div>
         </div>
+
+        {/* Detail or form */}
+        <div className="w-[420px] flex-shrink-0 overflow-y-auto p-6 select-text">
+          {editing ? (
+            <McpServerForm
+              key={editing.group ? editing.group.key : 'new'}
+              entry={editing.group?.primary}
+              defaultClients={editing.group ? writableEntries(editing.group).map((s) => s.client) : ['claude']}
+              lockedClients={locations.filter((l) => l.error).map((l) => l.client)}
+              busy={busy}
+              onCancel={() => setEditing(null)}
+              onSubmit={save}
+            />
+          ) : !selected ? (
+            <div className="h-full flex items-center justify-center text-[#86868b]">{m.selectHint}</div>
+          ) : (
+            (() => {
+              const entry = selected.primary;
+              const present = CLIENTS.filter((c) => selected.entries[c]);
+              const differs = present.some((c) => coreOf(selected.entries[c]!.spec) !== coreOf(entry.spec));
+              const editable = writableEntries(selected);
+              return (
+                <div className="flex flex-col gap-3">
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <h2 className="text-lg font-semibold tracking-tight text-[#1d1d1f] dark:text-white mr-1">{selected.name}</h2>
+                    <Badge tone="blue">{entry.transport}</Badge>
+                    {present.some((c) => selected.entries[c]!.read_only) && <Badge tone="purple"><Lock size={9} />{m.readOnly}</Badge>}
+                    {present.some((c) => selected.entries[c]!.cc_switch != null) && <Badge tone="orange" title={m.ccSwitchHint}>{m.ccSwitch}</Badge>}
+                  </div>
+
+                  <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1.5 text-[11px]">
+                    {CLIENTS.map((client) => (
+                      <React.Fragment key={client}>
+                        <dt className="text-[#86868b]">{CLIENT_LABEL[client]}</dt>
+                        <dd className={isOn(selected, client) ? 'text-[#248a3d] dark:text-[#30d158] font-medium' : 'text-[#86868b]'}>
+                          {stateLabel(selected, client)}
+                        </dd>
+                      </React.Fragment>
+                    ))}
+                    <dt className="text-[#86868b] pt-2">{m.transport}</dt>
+                    <dd className="font-mono pt-2">{entry.transport}</dd>
+                    {entry.transport === 'stdio' ? (
+                      <>
+                        <dt className="text-[#86868b]">{m.command}</dt>
+                        <dd className="font-mono break-all">{String(entry.spec.command ?? '')}</dd>
+                        {asStrings(entry.spec.args).length > 0 && (
+                          <>
+                            <dt className="text-[#86868b]">{m.args}</dt>
+                            <dd className="font-mono break-all">{asStrings(entry.spec.args).map((a, i) => <div key={i}>{a}</div>)}</dd>
+                          </>
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        <dt className="text-[#86868b]">{m.url}</dt>
+                        <dd className="font-mono break-all">{String(entry.spec.url ?? '')}</dd>
+                      </>
+                    )}
+                    {(['env', 'headers'] as const).map((field) => {
+                      const values = Object.entries(asStringMap(entry.spec[field]));
+                      if (values.length === 0) return null;
+                      return (
+                        <React.Fragment key={field}>
+                          <dt className="text-[#86868b]">{field === 'env' ? m.env : m.headers}</dt>
+                          <dd className="font-mono break-all">
+                            {values.map(([k, v]) => (
+                              <div key={k}>
+                                {k}
+                                {field === 'env' ? '=' : ': '}
+                                {reveal ? v : v ? '••••••' : ''}
+                              </div>
+                            ))}
+                          </dd>
+                        </React.Fragment>
+                      );
+                    })}
+                    {Object.keys(extraFields(entry.spec)).length > 0 && (
+                      <>
+                        <dt className="text-[#86868b]">{m.otherFields}</dt>
+                        <dd className="font-mono break-all whitespace-pre-wrap">
+                          {reveal ? JSON.stringify(extraFields(entry.spec), null, 1) : Object.keys(extraFields(entry.spec)).join(', ')}
+                        </dd>
+                      </>
+                    )}
+                  </dl>
+
+                  {differs && (
+                    <p className="flex items-start gap-1.5 text-[11px] text-[#c93400] dark:text-[#ff9f0a] leading-relaxed">
+                      <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+                      {interpolate(m.differs, { client: CLIENT_LABEL[entry.client] })}
+                    </p>
+                  )}
+
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <Button size="sm" icon={<Pencil size={13} />} disabled={busy || editable.length === 0} onClick={() => setEditing({ group: selected })}>
+                      {m.edit}
+                    </Button>
+                    <Button size="sm" variant="danger" icon={<Trash2 size={13} />} disabled={busy || editable.length === 0} onClick={() => setConfirmDelete(true)}>
+                      {m.delete}
+                    </Button>
+                    <div className="flex-1" />
+                    <Button size="sm" variant="ghost" icon={reveal ? <EyeOff size={13} /> : <Eye size={13} />} onClick={() => setReveal((v) => !v)}>
+                      {reveal ? m.hideValues : m.showValues}
+                    </Button>
+                    <Button size="sm" variant="ghost" icon={<FileCode2 size={13} />} onClick={() => setShowRaw((v) => !v)}>
+                      {m.raw}
+                    </Button>
+                  </div>
+
+                  {present.some((c) => selected.entries[c]!.cc_switch != null) && (
+                    <p className="flex items-start gap-1.5 text-[11px] text-[#c93400] dark:text-[#ff9f0a] leading-relaxed">
+                      <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+                      {m.ccSwitchHint}
+                    </p>
+                  )}
+
+                  {confirmDelete && (
+                    <div className="p-3 rounded-xl border border-[#ff453a]/25 bg-[#ff453a]/[0.06] flex items-center gap-3">
+                      <p className="flex-1 leading-relaxed">
+                        {interpolate(m.deleteFrom, { clients: editable.map((s) => CLIENT_LABEL[s.client]).join('、') })}
+                      </p>
+                      <Button size="sm" variant="ghost" onClick={() => setConfirmDelete(false)}>
+                        {t.common.cancel}
+                      </Button>
+                      <Button size="sm" variant="danger" disabled={busy} onClick={() => deleteGroup(selected)}>
+                        {m.confirmDelete}
+                      </Button>
+                    </div>
+                  )}
+
+                  {showRaw &&
+                    present.map((client) => (
+                      <div key={client}>
+                        <div className="text-[11px] font-semibold text-[#86868b] mb-1">
+                          {CLIENT_LABEL[client]} · <span className="font-mono font-normal">{location(client)?.config_path}</span>
+                        </div>
+                        <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed p-3 rounded-xl bg-black/[0.04] dark:bg-black/40 border border-black/[0.06] dark:border-white/[0.06] max-h-[40vh] overflow-y-auto">
+                          {selected.entries[client]!.raw}
+                        </pre>
+                      </div>
+                    ))}
+                </div>
+              );
+            })()
+          )}
+        </div>
       </div>
-    </Modal>
+    </div>
   );
 };
 
 interface McpServerFormProps {
   /** The server being edited; absent when creating. */
   entry?: McpServerEntry;
+  /** Where to save: the clients that have the server when editing, the preselected ones when creating. */
   defaultClients: McpClient[];
   /** Clients whose config file cannot be written. */
   lockedClients: McpClient[];
@@ -497,7 +551,8 @@ const McpServerForm: React.FC<McpServerFormProps> = ({ entry, defaultClients, lo
   const m = t.mcp;
   const initial = entry?.spec ?? {};
   const [name, setName] = useState(entry?.name ?? '');
-  const [clients, setClients] = useState<McpClient[]>(entry ? [entry.client] : defaultClients.filter((c) => !lockedClients.includes(c)));
+  // Editing saves to every client that has the server; creating to the clients ticked below.
+  const [clients, setClients] = useState<McpClient[]>(defaultClients.filter((c) => !lockedClients.includes(c)));
   const [mode, setMode] = useState<'form' | 'json'>('form');
   const [transport, setTransport] = useState(entry?.transport ?? 'stdio');
   const [command, setCommand] = useState(String(initial.command ?? ''));

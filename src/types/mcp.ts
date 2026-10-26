@@ -1,5 +1,5 @@
-/** Client whose MCP servers are managed: Claude Code (`~/.claude.json`) or Codex (`config.toml`). */
-export type McpClient = 'claude' | 'codex';
+/** Client whose MCP servers are managed: Claude Code (`~/.claude.json`), Codex (`config.toml`) or Antigravity (`~/.gemini/config/mcp_config.json`). */
+export type McpClient = 'claude' | 'codex' | 'antigravity';
 
 export type McpTransport = 'stdio' | 'http' | 'sse';
 
@@ -15,7 +15,7 @@ export interface McpServerEntry {
   name: string;
   transport: McpTransport | string;
   spec: McpSpec;
-  /** Claude: false when moved to the app's stash; Codex: `enabled = false`. */
+  /** Claude: false when moved to the app's stash; Codex: `enabled = false`; Antigravity: `"disabled": true`. */
   enabled: boolean;
   /** Written and maintained by the Codex desktop app. */
   read_only: boolean;

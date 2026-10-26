@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import {
+  Braces,
+  ChevronDown,
   Code2,
   Download,
   Edit2,
@@ -15,6 +17,7 @@ import {
 import { CanonicalMessage, Conversation } from '../types';
 import { extractProjectName, formatDateTime } from '../utils/formatters';
 import { Button } from './common/Button';
+import { DropdownMenu } from './common/DropdownMenu';
 import { MessageBubble } from './MessageBubble';
 import { useI18n } from '../i18n';
 
@@ -105,12 +108,12 @@ export const ChatView: React.FC<ChatViewProps> = ({
   return (
     <main className="flex-1 h-full flex flex-col bg-[#f5f5f7] dark:bg-[#050507] overflow-hidden transition-colors">
       {/* Apple Style Top Conversation Header */}
-      <div className="px-6 py-3.5 backdrop-blur-xl bg-white/75 dark:bg-black/60 border-b border-black/[0.06] dark:border-white/[0.08] flex flex-col gap-2 flex-shrink-0 z-10 transition-colors">
+      <div className="px-6 py-3.5 bg-white dark:bg-[#121214] border-b border-black/[0.06] dark:border-white/[0.08] flex flex-col gap-2 flex-shrink-0 z-10 transition-colors">
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <h2
-                className="text-base font-semibold tracking-tight bg-gradient-to-r from-[#1d1d1f] via-[#2d2d30] to-[#515154] dark:from-white dark:via-[#f5f5f7] dark:to-[#a1a1a6] bg-clip-text text-transparent truncate leading-snug"
+                className="text-base font-semibold tracking-tight text-[#1d1d1f] dark:text-white truncate leading-snug"
                 title={conversation.title}
               >
                 {conversation.title}
@@ -158,22 +161,18 @@ export const ChatView: React.FC<ChatViewProps> = ({
           </div>
 
           {/* Apple Pill Action Toolbar */}
-          <div className="flex items-center gap-1.5 flex-shrink-0">
+          <div className="flex items-center gap-2 flex-shrink-0">
             {conversation.project_path && (
               <>
                 <Button
-                  variant="secondary"
-                  size="sm"
-                  icon={<Folder size={12} className="text-[#86868b]" />}
+                  icon={<Folder size={13} />}
                   onClick={() => onOpenFolder(conversation.project_path!)}
                   title={t.chat.openFolderTooltip}
                 >
                   {t.chat.openFolder}
                 </Button>
                 <Button
-                  variant="secondary"
-                  size="sm"
-                  icon={<Code2 size={12} className="text-[#0071e3] dark:text-[#2997ff]" />}
+                  icon={<Code2 size={13} />}
                   onClick={() => onOpenVSCode(conversation.project_path!)}
                   title={t.chat.openVSCodeTooltip}
                 >
@@ -182,35 +181,35 @@ export const ChatView: React.FC<ChatViewProps> = ({
               </>
             )}
 
-            <Button
-              variant="secondary"
-              size="sm"
-              icon={<FileText size={12} className="text-[#86868b]" />}
-              onClick={() => onExportMarkdown(conversation.id, conversation.title, conversation.project_path)}
-              title={t.chat.saveMarkdownTooltip}
-            >
-              {t.chat.saveMarkdown}
-            </Button>
-
-            <Button
-              variant="ghost"
-              size="sm"
-              icon={<Download size={12} className="text-[#86868b]" />}
-              onClick={() => onExportJson(conversation.id, conversation.title, conversation.project_path)}
-              title={t.chat.exportJsonTooltip}
-            >
-              {t.chat.exportJson}
-            </Button>
+            <DropdownMenu
+              label={t.chat.export}
+              title={t.chat.exportTooltip}
+              icon={<Download size={13} />}
+              trailing={<ChevronDown size={12} className="-mr-0.5 text-[#86868b]" />}
+              items={[
+                {
+                  key: 'markdown',
+                  label: t.chat.saveMarkdown,
+                  icon: <FileText size={13} />,
+                  onSelect: () => onExportMarkdown(conversation.id, conversation.title, conversation.project_path),
+                },
+                {
+                  key: 'json',
+                  label: t.chat.exportJson,
+                  icon: <Braces size={13} />,
+                  onSelect: () => onExportJson(conversation.id, conversation.title, conversation.project_path),
+                },
+              ]}
+            />
 
             <Button
               variant="danger"
-              size="sm"
-              icon={<Trash2 size={12} />}
+              icon={<Trash2 size={13} />}
               onClick={() => onDelete(conversation.id, conversation.title)}
               title={t.chat.deleteTooltip}
-            >
-              {t.chat.delete}
-            </Button>
+              aria-label={t.chat.deleteTooltip}
+              className="px-2"
+            />
           </div>
         </div>
       </div>

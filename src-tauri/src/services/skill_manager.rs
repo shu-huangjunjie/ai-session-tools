@@ -1,7 +1,8 @@
-//! Claude / Codex 技能管理：列出、查看、新建、停用、挂载（目录联接）与删除技能。
+//! Claude / Codex / Antigravity 技能管理：列出、查看、新建、停用、挂载（目录联接）与删除技能。
 //!
 //! 技能是一个含 `SKILL.md` 的文件夹。客户端从各自的技能目录加载：
-//! Claude 为 `~/.claude/skills`，Codex 为 `~/.codex/skills`（其中 `.system` 为内置技能，只读）。
+//! Claude 为 `~/.claude/skills`，Codex 为 `~/.codex/skills`（其中 `.system` 为内置技能，只读），
+//! Antigravity 为 `~/.gemini/config/skills`（内置技能在 `~/.gemini/antigravity/builtin/skills`，只读）。
 //! 停用的技能移到同级的 `skills-disabled` 目录，客户端不再加载，随时可以移回。
 //! 技能库是用户自选的文件夹，库中的技能以目录联接挂载到客户端技能目录，文件只保存一份。
 //!
@@ -28,6 +29,27 @@ const MAX_PREVIEW_BYTES: u64 = 512 * 1024;
 pub enum SkillClient {
     Claude,
     Codex,
+    Antigravity,
+}
+
+const CLIENTS: [SkillClient; 3] = [SkillClient::Claude, SkillClient::Codex, SkillClient::Antigravity];
+
+impl SkillClient {
+    fn label(self) -> &'static str {
+        match self {
+            SkillClient::Claude => "Claude",
+            SkillClient::Codex => "Codex",
+            SkillClient::Antigravity => "Antigravity",
+        }
+    }
+
+    fn kind(self) -> SkillLocationKind {
+        match self {
+            SkillClient::Claude => SkillLocationKind::Claude,
+            SkillClient::Codex => SkillLocationKind::Codex,
+            SkillClient::Antigravity => SkillLocationKind::Antigravity,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,7 +57,19 @@ pub enum SkillClient {
 pub enum SkillLocationKind {
     Claude,
     Codex,
+    Antigravity,
     Library,
+}
+
+impl SkillLocationKind {
+    fn client(self) -> Option<SkillClient> {
+        match self {
+            SkillLocationKind::Claude => Some(SkillClient::Claude),
+            SkillLocationKind::Codex => Some(SkillClient::Codex),
+            SkillLocationKind::Antigravity => Some(SkillClient::Antigravity),
+            SkillLocationKind::Library => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -51,14 +85,14 @@ pub struct SkillEntry {
     pub link_broken: bool,
     pub has_skill_file: bool,
     pub enabled: bool,
-    /// Codex 内置技能，只读。
+    /// 客户端自带的内置技能，只读。
     pub system: bool,
     pub file_count: usize,
     pub total_bytes: u64,
     pub modified_at: Option<String>,
     /// 技能库中的技能已挂载到哪些客户端。
     pub mounted_in: Vec<SkillClient>,
-    /// 客户端技能在另一个客户端中也有（指向同一原件的联接或就是同一文件夹）。
+    /// 客户端技能在其他客户端中也有（指向同一原件的联接或就是同一文件夹）。
     pub shared_with: Vec<SkillClient>,
     /// cc-switch 登记了同名技能时，它对该客户端是否启用；未登记为空。
     pub cc_switch: Option<bool>,
@@ -91,11 +125,13 @@ struct Placement {
 pub struct SkillManager {
     claude_home: PathBuf,
     codex_home: PathBuf,
+    /// `~/.gemini`。
+    gemini_home: PathBuf,
     libraries: Vec<PathBuf>,
 }
 
 impl SkillManager {
-    pub fn new(claude_home: &Path, codex_home: &Path, libraries: &[String]) -> Self {
+    pub fn new(claude_home: &Path, codex_home: &Path, gemini_home: &Path, libraries: &[String]) -> Self {
         let mut seen = Vec::new();
         let libraries = libraries
             .iter()
@@ -111,21 +147,34 @@ impl SkillManager {
         Self {
             claude_home: claude_home.to_path_buf(),
             codex_home: codex_home.to_path_buf(),
+            gemini_home: gemini_home.to_path_buf(),
             libraries,
         }
     }
 
-    pub fn client_root(&self, client: SkillClient) -> PathBuf {
+    /// 客户端加载技能的目录；停用的技能在同级的 `skills-disabled`。
+    fn client_dir(&self, client: SkillClient) -> PathBuf {
         match client {
-            SkillClient::Claude => self.claude_home.join("skills"),
-            SkillClient::Codex => self.codex_home.join("skills"),
+            SkillClient::Claude => self.claude_home.clone(),
+            SkillClient::Codex => self.codex_home.clone(),
+            SkillClient::Antigravity => self.gemini_home.join("config"),
         }
     }
 
+    pub fn client_root(&self, client: SkillClient) -> PathBuf {
+        self.client_dir(client).join("skills")
+    }
+
     fn disabled_root(&self, client: SkillClient) -> PathBuf {
+        self.client_dir(client).join(DISABLED_DIR)
+    }
+
+    /// 客户端自带的内置技能目录，只读。
+    fn system_root(&self, client: SkillClient) -> Option<PathBuf> {
         match client {
-            SkillClient::Claude => self.claude_home.join(DISABLED_DIR),
-            SkillClient::Codex => self.codex_home.join(DISABLED_DIR),
+            SkillClient::Claude => None,
+            SkillClient::Codex => Some(self.client_root(client).join(CODEX_SYSTEM_DIR)),
+            SkillClient::Antigravity => Some(self.gemini_home.join("antigravity").join("builtin").join("skills")),
         }
     }
 
@@ -133,13 +182,13 @@ impl SkillManager {
         // 先收集客户端技能目录中的联接，用于标注技能库中的技能挂载到了哪里。
         let mut mounts: HashMap<String, Vec<SkillClient>> = HashMap::new();
         let mut locations = Vec::new();
-        for client in [SkillClient::Claude, SkillClient::Codex] {
+        for client in CLIENTS {
             let root = self.client_root(client);
             let disabled = self.disabled_root(client);
             let mut skills = scan_dir(&root, true, false);
             skills.extend(scan_dir(&disabled, false, false));
-            if client == SkillClient::Codex {
-                skills.extend(scan_dir(&root.join(CODEX_SYSTEM_DIR), true, true));
+            if let Some(system) = self.system_root(client) {
+                skills.extend(scan_dir(&system, true, true));
             }
             for skill in &skills {
                 if let Some(target) = &skill.link_target {
@@ -151,27 +200,27 @@ impl SkillManager {
             }
             skills.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
             locations.push(SkillLocation {
-                kind: match client {
-                    SkillClient::Claude => SkillLocationKind::Claude,
-                    SkillClient::Codex => SkillLocationKind::Codex,
-                },
+                kind: client.kind(),
                 exists: root.is_dir(),
                 root: display(&root),
                 disabled_root: Some(display(&disabled)),
                 skills,
             });
         }
-        // 两个客户端里指向同一原件的技能互相标注。
+        // 各客户端里指向同一原件的技能互相标注。
         let real_keys: Vec<Vec<String>> = locations
             .iter()
             .map(|l: &SkillLocation| l.skills.iter().map(real_key).collect())
             .collect();
         for (i, location) in locations.iter_mut().enumerate() {
-            let other = 1 - i;
-            let other_client = if other == 0 { SkillClient::Claude } else { SkillClient::Codex };
             for (skill, key) in location.skills.iter_mut().zip(&real_keys[i]) {
-                if !skill.link_broken && real_keys[other].contains(key) {
-                    skill.shared_with.push(other_client);
+                if skill.link_broken {
+                    continue;
+                }
+                for (j, other) in CLIENTS.iter().enumerate() {
+                    if j != i && real_keys[j].contains(key) {
+                        skill.shared_with.push(*other);
+                    }
                 }
             }
         }
@@ -206,7 +255,7 @@ impl SkillManager {
         Ok(String::from_utf8_lossy(&bytes).trim_start_matches('\u{feff}').to_string())
     }
 
-    /// 新建技能文件夹和 SKILL.md。`target` 为 claude、codex 或技能库路径。
+    /// 新建技能文件夹和 SKILL.md。`target` 为 claude、codex、antigravity 或技能库路径。
     pub fn create(&self, target: &str, folder_name: &str, description: &str) -> Result<PathBuf, String> {
         validate_skill_name(folder_name)?;
         let description = description.trim();
@@ -216,6 +265,7 @@ impl SkillManager {
         let root = match target {
             "claude" => self.client_root(SkillClient::Claude),
             "codex" => self.client_root(SkillClient::Codex),
+            "antigravity" => self.client_root(SkillClient::Antigravity),
             other => {
                 let wanted = path_key(Path::new(&crate::util::normalize_windows_path(other)));
                 self.libraries
@@ -247,13 +297,12 @@ impl SkillManager {
     pub fn set_enabled(&self, path: &str, enabled: bool) -> Result<PathBuf, String> {
         let source = PathBuf::from(crate::util::normalize_windows_path(path));
         let placement = self.placement(&source)?;
-        let client = match placement.kind {
-            SkillLocationKind::Claude => SkillClient::Claude,
-            SkillLocationKind::Codex => SkillClient::Codex,
-            SkillLocationKind::Library => return Err("技能库中的技能不直接被加载，请用挂载或取消挂载控制".into()),
-        };
+        let client = placement
+            .kind
+            .client()
+            .ok_or("技能库中的技能不直接被加载，请用挂载或取消挂载控制")?;
         if placement.system {
-            return Err("Codex 内置技能为只读，不能停用".into());
+            return Err("客户端自带的内置技能为只读，不能停用".into());
         }
         if placement.enabled == enabled {
             return Ok(source);
@@ -300,16 +349,12 @@ impl SkillManager {
     /// （本身是联接时指向它的目标），文件只保存一份。
     pub fn link_to_client(&self, path: &str, client: SkillClient) -> Result<PathBuf, String> {
         let (real, placement) = self.locate(path)?;
-        let source_client = match placement.kind {
-            SkillLocationKind::Claude => SkillClient::Claude,
-            SkillLocationKind::Codex => SkillClient::Codex,
-            SkillLocationKind::Library => return Err("技能库中的技能请用挂载".into()),
-        };
+        let source_client = placement.kind.client().ok_or("技能库中的技能请用挂载")?;
         if source_client == client {
             return Err("技能已经在这个客户端中".into());
         }
         if placement.system {
-            return Err("Codex 内置技能随 Codex 更新，不能同步到其他客户端".into());
+            return Err("客户端自带的内置技能随客户端更新，不能同步到其他客户端".into());
         }
         if !real.join(SKILL_FILE).is_file() {
             return Err(format!("该技能没有 {}，不能同步", SKILL_FILE));
@@ -318,10 +363,7 @@ impl SkillManager {
         let root = self.client_root(client);
         for existing in [root.join(&name), self.disabled_root(client).join(&name)] {
             if fs::symlink_metadata(&existing).is_ok() {
-                return Err(format!("{} 中已有同名技能：{}", match client {
-                    SkillClient::Claude => "Claude",
-                    SkillClient::Codex => "Codex",
-                }, existing.display()));
+                return Err(format!("{} 中已有同名技能：{}", client.label(), existing.display()));
             }
         }
         fs::create_dir_all(&root).map_err(|e| format!("无法创建技能目录 {}：{}", root.display(), e))?;
@@ -335,15 +377,15 @@ impl SkillManager {
         let target = PathBuf::from(crate::util::normalize_windows_path(path));
         let placement = self.placement(&target)?;
         if placement.system {
-            return Err("Codex 内置技能为只读，不能删除".into());
+            return Err("客户端自带的内置技能为只读，不能删除".into());
         }
         if is_reparse_point(&target) {
             remove_link(&target)?;
             return Ok(SkillDeleteOutcome::LinkRemoved);
         }
-        // 另一个客户端的联接指向这个文件夹时，删除会让那边的技能失效。
+        // 其他客户端的联接指向这个文件夹时，删除会让那边的技能失效。
         let key = path_key(&target);
-        for client in [SkillClient::Claude, SkillClient::Codex] {
+        for client in CLIENTS {
             for root in [self.client_root(client), self.disabled_root(client)] {
                 let Ok(entries) = fs::read_dir(&root) else { continue };
                 for entry in entries.flatten() {
@@ -383,18 +425,15 @@ impl SkillManager {
             return Err(format!("技能不存在：{}", dir.display()));
         }
         let parent_key = path_key(parent);
-        for (client, kind) in [
-            (SkillClient::Claude, SkillLocationKind::Claude),
-            (SkillClient::Codex, SkillLocationKind::Codex),
-        ] {
-            let root = self.client_root(client);
-            if parent_key == path_key(&root) {
+        for client in CLIENTS {
+            let kind = client.kind();
+            if parent_key == path_key(&self.client_root(client)) {
                 return Ok(Placement { kind, enabled: true, system: false });
             }
             if parent_key == path_key(&self.disabled_root(client)) {
                 return Ok(Placement { kind, enabled: false, system: false });
             }
-            if client == SkillClient::Codex && parent_key == path_key(&root.join(CODEX_SYSTEM_DIR)) {
+            if self.system_root(client).is_some_and(|s| parent_key == path_key(&s)) {
                 return Ok(Placement { kind, enabled: true, system: true });
             }
         }
@@ -405,7 +444,7 @@ impl SkillManager {
     }
 }
 
-/// 列出目录下的技能文件夹（只看一层）。
+// 列出目录下的技能文件夹（只看一层）。
 fn scan_dir(root: &Path, enabled: bool, system: bool) -> Vec<SkillEntry> {
     let Ok(entries) = fs::read_dir(root) else { return Vec::new() };
     let mut skills = Vec::new();
@@ -700,7 +739,7 @@ mod tests {
     impl Drop for TempDir {
         fn drop(&mut self) {
             // 先移除测试中创建的联接，避免递归删除时进入目标。
-            for root in ["claude/skills", "claude/skills-disabled", "codex/skills"] {
+            for root in ["claude/skills", "claude/skills-disabled", "codex/skills", "gemini/config/skills", "gemini/config/skills-disabled"] {
                 if let Ok(entries) = fs::read_dir(self.0.join(root)) {
                     for e in entries.flatten() {
                         if is_reparse_point(&e.path()) {
@@ -722,7 +761,7 @@ mod tests {
 
     fn manager(t: &TempDir, libraries: &[&Path]) -> SkillManager {
         let libs: Vec<String> = libraries.iter().map(|p| p.to_string_lossy().to_string()).collect();
-        SkillManager::new(&t.0.join("claude"), &t.0.join("codex"), &libs)
+        SkillManager::new(&t.0.join("claude"), &t.0.join("codex"), &t.0.join("gemini"), &libs)
     }
 
     #[test]
@@ -753,14 +792,14 @@ mod tests {
         fs::create_dir_all(t.0.join("lib/empty-folder")).unwrap();
         let lib = t.0.join("lib");
         let locations = manager(&t, &[&lib]).list();
-        assert_eq!(locations.len(), 3);
+        assert_eq!(locations.len(), 4);
         let claude = &locations[0];
         assert_eq!(claude.skills.iter().map(|s| (s.folder_name.as_str(), s.enabled)).collect::<Vec<_>>(),
                    vec![("alpha", true), ("beta", false)]);
         let codex = &locations[1];
         assert_eq!(codex.skills.len(), 1);
         assert!(codex.skills[0].system);
-        let library = &locations[2];
+        let library = &locations[3];
         assert_eq!(library.skills[0].folder_name, "empty-folder");
         assert!(!library.skills[0].has_skill_file);
     }
@@ -804,7 +843,7 @@ mod tests {
         assert!(m.mount(&source.to_string_lossy(), SkillClient::Claude).is_err());
 
         let locations = m.list();
-        let mounted = &locations[2].skills[0];
+        let mounted = &locations[3].skills[0];
         assert_eq!(mounted.mounted_in, vec![SkillClient::Claude]);
         let entry = &locations[0].skills[0];
         assert_eq!(entry.link_target.as_deref().map(|p| path_key(Path::new(p))), Some(path_key(&source)));
@@ -817,7 +856,7 @@ mod tests {
         assert_eq!(m.delete(&disabled.to_string_lossy()).unwrap(), SkillDeleteOutcome::LinkRemoved);
         assert!(fs::symlink_metadata(&disabled).is_err());
         assert_eq!(fs::read_to_string(source.join("notes.txt")).unwrap(), "keep me");
-        assert!(m.list()[2].skills[0].mounted_in.is_empty());
+        assert!(m.list()[3].skills[0].mounted_in.is_empty());
     }
 
     #[test]
@@ -852,6 +891,39 @@ name: shared
         let claude_link = m.mount(&original.to_string_lossy(), SkillClient::Claude).unwrap();
         let codex_link = m.link_to_client(&claude_link.to_string_lossy(), SkillClient::Codex).unwrap();
         assert_eq!(path_key(&fs::read_link(&codex_link).unwrap()), path_key(&original));
-        assert_eq!(m.list()[2].skills[0].mounted_in, vec![SkillClient::Claude, SkillClient::Codex]);
+        assert_eq!(m.list()[3].skills[0].mounted_in, vec![SkillClient::Claude, SkillClient::Codex]);
+    }
+
+    #[test]
+    fn antigravity_loads_from_gemini_config_and_keeps_builtin_read_only() {
+        let t = TempDir::new();
+        let builtin = skill(&t.0.join("gemini/antigravity/builtin/skills"), "agy-guide", "---
+name: agy-guide
+description: G
+---
+");
+        let source = skill(&t.0.join("claude/skills"), "local", "---
+name: local
+description: L
+---
+");
+        let m = manager(&t, &[]);
+        let link = m.link_to_client(&source.to_string_lossy(), SkillClient::Antigravity).unwrap();
+        assert!(link.starts_with(t.0.join("gemini/config/skills")));
+
+        let locations = m.list();
+        let agy = &locations[2];
+        assert_eq!(agy.kind, SkillLocationKind::Antigravity);
+        assert_eq!(agy.skills.iter().map(|s| (s.folder_name.as_str(), s.system)).collect::<Vec<_>>(),
+                   vec![("local", false), ("agy-guide", true)]);
+        assert_eq!(locations[0].skills[0].shared_with, vec![SkillClient::Antigravity]);
+
+        // 内置技能随 Antigravity 更新，不能停用、删除或同步出去。
+        assert!(m.set_enabled(&builtin.to_string_lossy(), false).is_err());
+        assert!(m.delete(&builtin.to_string_lossy()).is_err());
+        assert!(m.link_to_client(&builtin.to_string_lossy(), SkillClient::Claude).is_err());
+        let disabled = m.set_enabled(&link.to_string_lossy(), false).unwrap();
+        assert!(disabled.starts_with(t.0.join("gemini/config/skills-disabled")));
+        assert!(m.create("antigravity", "fresh", "Use when testing").unwrap().starts_with(t.0.join("gemini/config/skills")));
     }
 }

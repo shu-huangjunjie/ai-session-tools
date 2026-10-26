@@ -18,7 +18,8 @@ import {
   FolderPin,
   ResetResult,
 } from './types';
-import { Header } from './components/Header';
+import { NavRail, AppPage, APP_PAGES } from './components/NavRail';
+import { SessionsHeader } from './components/SessionsHeader';
 import { Sidebar } from './components/Sidebar';
 import { ChatView } from './components/ChatView';
 import { CodexRecoveryModal } from './components/CodexRecoveryModal';
@@ -29,6 +30,7 @@ import { ClaudePublishModal } from './components/ClaudePublishModal';
 import { ImportModal } from './components/ImportModal';
 import { SkillsManager } from './components/SkillsManager';
 import { McpManager } from './components/McpManager';
+import { AccountsManager } from './components/AccountsManager';
 
 import { Modal } from './components/common/Modal';
 import { Button } from './components/common/Button';
@@ -61,6 +63,15 @@ export const App: React.FC = () => {
 
   const toggleTheme = () => {
     setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
+  };
+
+  const [page, setPage] = useState<AppPage>(() => {
+    const saved = localStorage.getItem('cv_active_page') as AppPage | null;
+    return saved && APP_PAGES.includes(saved) ? saved : 'sessions';
+  });
+  const changePage = (next: AppPage) => {
+    setPage(next);
+    localStorage.setItem('cv_active_page', next);
   };
 
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
@@ -204,8 +215,6 @@ export const App: React.FC = () => {
   const [isPublishingClaude, setIsPublishingClaude] = useState(false);
 
   const [importModalOpen, setImportModalOpen] = useState(false);
-  const [skillsOpen, setSkillsOpen] = useState(false);
-  const [mcpOpen, setMcpOpen] = useState(false);
 
   // Codex publish confirmation
   const [codexPublishDialog, setCodexPublishDialog] = useState<{
@@ -241,8 +250,6 @@ export const App: React.FC = () => {
     claudeModalOpen ||
     claudePublishModalOpen ||
     importModalOpen ||
-    skillsOpen ||
-    mcpOpen ||
     renameDialog !== null ||
     deleteDialog !== null ||
     codexPublishDialog !== null ||
@@ -372,12 +379,13 @@ export const App: React.FC = () => {
     };
   }, [selectedId]);
 
-  // Global Keyboard Shortcuts: F2 for rename, Del for delete
+  // Global Keyboard Shortcuts: Ctrl+K to search, F2 for rename, Del for delete
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         if (anyDialogOpen) return;
+        changePage('sessions');
         setTimeout(() => {
           const input = document.getElementById('sidebar-search') as HTMLInputElement | null;
           input?.focus();
@@ -385,10 +393,12 @@ export const App: React.FC = () => {
         }, 0);
         return;
       }
+      // F2 and Del act on the open conversation, which only the sessions page shows.
       if (
         e.target instanceof HTMLInputElement ||
         e.target instanceof HTMLTextAreaElement ||
-        anyDialogOpen
+        anyDialogOpen ||
+        page !== 'sessions'
       ) {
         return;
       }
@@ -410,7 +420,7 @@ export const App: React.FC = () => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedId, activeConversation, anyDialogOpen]);
+  }, [selectedId, activeConversation, anyDialogOpen, page]);
 
   // Search input handler: wait for a pause in typing before querying the index.
   const searchTimer = useRef<ReturnType<typeof setTimeout>>();
@@ -913,83 +923,95 @@ export const App: React.FC = () => {
   };
 
   return (
-    <div className="w-full h-full flex flex-col bg-[#f5f5f7] dark:bg-black overflow-hidden text-[#1d1d1f] dark:text-[#ededf0] transition-colors duration-200">
-      {/* Global Header */}
-      <Header
-        onClearDatabase={handleOpenReset}
-        isClearingDatabase={isPreparingReset || isResetting || scanning !== null}
-        activeSource={activeSource}
-        onSourceChange={handleSourceChange}
-        codexCount={codexConversations.length}
-        codexVisibleCount={codexVisibleCount}
-        antigravityCount={antigravityConversations.length}
-        claudeCount={claudeConversations.length}
-        onBackup={handleBackup}
-        onOpenImport={() => setImportModalOpen(true)}
-        onOpenSkills={() => setSkillsOpen(true)}
-        onOpenMcp={() => setMcpOpen(true)}
-        theme={theme}
-        onToggleTheme={toggleTheme}
-        onOpenClient={handleOpenClient}
-        isOpeningClient={isOpeningClient}
-      />
+    <div className="w-full h-full flex bg-[#f5f5f7] dark:bg-black overflow-hidden text-[#1d1d1f] dark:text-[#ededf0] transition-colors duration-200">
+      <NavRail page={page} onPageChange={changePage} theme={theme} onToggleTheme={toggleTheme} />
 
-      {/* Main Content Area */}
-      <div className="flex-1 flex overflow-hidden">
-            <Sidebar
-              width={sidebarWidth}
-              conversations={displayedConversations}
-              selectedId={selectedId}
-              onSelectConversation={setSelectedId}
+      {/* Only the active page is mounted; the others reload when opened. */}
+      <div className="flex-1 min-w-0 flex flex-col overflow-hidden">
+        {page === 'sessions' && (
+          <>
+            <SessionsHeader
               activeSource={activeSource}
-              publishSelection={publishSelection}
-              onTogglePublishSelection={togglePublishSelection}
-              onToggleProjectPublishSelection={toggleProjectPublishSelection}
-              onClearSelection={handleClearSelection}
-              onBatchExportMarkdown={handleBatchExportMarkdown}
-              onBatchDelete={handleBatchDelete}
-              onScanCodex={handleScanCodex}
-              onScanAntigravity={handleScanAntigravity}
-              onScanClaude={handleScanClaude}
-              onPublishToCodex={handlePublishToCodex}
-              onPublishToAntigravity={handleOpenPublishAntigravity}
-              onPublishToClaude={handleOpenPublishClaude}
-              onOpenFolder={handleOpenFolder}
-              onOpenVSCode={handleOpenVSCode}
-              onRename={handleRename}
-              onDelete={handleDeleteSingle}
-              onSetPinned={handleSetPinned}
-              folderPins={folderPins}
-              onSetFolderPinned={handleSetFolderPinned}
-              searchQuery={searchQuery}
+              onSourceChange={handleSourceChange}
+              codexCount={codexConversations.length}
+              codexVisibleCount={codexVisibleCount}
+              antigravityCount={antigravityConversations.length}
+              claudeCount={claudeConversations.length}
+              selectionCount={publishSelection.size}
+              onScan={
+                activeSource === 'codex'
+                  ? handleScanCodex
+                  : activeSource === 'antigravity'
+                  ? handleScanAntigravity
+                  : handleScanClaude
+              }
+              isScanning={scanning !== null}
+              onPublish={
+                activeSource === 'codex'
+                  ? handlePublishToCodex
+                  : activeSource === 'antigravity'
+                  ? handleOpenPublishAntigravity
+                  : handleOpenPublishClaude
+              }
+              onOpenClient={() => handleOpenClient()}
+              isOpeningClient={isOpeningClient}
+              onClearDatabase={handleOpenReset}
+              isClearingDatabase={isPreparingReset || isResetting || scanning !== null}
+              onOpenImport={() => setImportModalOpen(true)}
+              onBackup={handleBackup}
               showArchived={showArchived}
               onShowArchivedChange={setShowArchived}
-              onSearchChange={handleSearchChange}
-              onOpenClient={handleOpenClient}
-              isOpeningClient={isOpeningClient}
-              isScanning={scanning !== null}
-              codexVisibility={codexVisibility}
             />
-            {/* Resizable Divider Handle */}
-            <div
-              onMouseDown={startResizing}
-              onDoubleClick={resetSidebarWidth}
-              title={t.sidebar.resizerTooltip}
-              className={`sidebar-resizer ${
-                isResizing ? 'is-resizing' : ''
-              } bg-black/[0.04] dark:bg-white/[0.04] border-r border-black/[0.06] dark:border-white/[0.08] hover:bg-[#0071e3] transition-colors`}
-            />
-            <ChatView
-              conversation={activeConversation}
-              messages={messages}
-              isLoading={isLoadingMessages}
-              onRename={handleRename}
-              onDelete={handleDeleteSingle}
-              onExportMarkdown={handleExportMarkdown}
-              onExportJson={handleExportJson}
-              onOpenFolder={handleOpenFolder}
-              onOpenVSCode={handleOpenVSCode}
-            />
+            <div className="flex-1 flex overflow-hidden">
+              <Sidebar
+                width={sidebarWidth}
+                conversations={displayedConversations}
+                selectedId={selectedId}
+                onSelectConversation={setSelectedId}
+                activeSource={activeSource}
+                publishSelection={publishSelection}
+                onTogglePublishSelection={togglePublishSelection}
+                onToggleProjectPublishSelection={toggleProjectPublishSelection}
+                onClearSelection={handleClearSelection}
+                onBatchExportMarkdown={handleBatchExportMarkdown}
+                onBatchDelete={handleBatchDelete}
+                onOpenFolder={handleOpenFolder}
+                onOpenVSCode={handleOpenVSCode}
+                onRename={handleRename}
+                onDelete={handleDeleteSingle}
+                onSetPinned={handleSetPinned}
+                folderPins={folderPins}
+                onSetFolderPinned={handleSetFolderPinned}
+                searchQuery={searchQuery}
+                onSearchChange={handleSearchChange}
+                codexVisibility={codexVisibility}
+              />
+              {/* Resizable Divider Handle */}
+              <div
+                onMouseDown={startResizing}
+                onDoubleClick={resetSidebarWidth}
+                title={t.sidebar.resizerTooltip}
+                className={`sidebar-resizer ${
+                  isResizing ? 'is-resizing' : ''
+                } bg-black/[0.04] dark:bg-white/[0.04] border-r border-black/[0.06] dark:border-white/[0.08] hover:bg-[#0071e3] transition-colors`}
+              />
+              <ChatView
+                conversation={activeConversation}
+                messages={messages}
+                isLoading={isLoadingMessages}
+                onRename={handleRename}
+                onDelete={handleDeleteSingle}
+                onExportMarkdown={handleExportMarkdown}
+                onExportJson={handleExportJson}
+                onOpenFolder={handleOpenFolder}
+                onOpenVSCode={handleOpenVSCode}
+              />
+            </div>
+          </>
+        )}
+        {page === 'skills' && <SkillsManager onToast={addToast} />}
+        {page === 'mcp' && <McpManager onToast={addToast} />}
+        {page === 'accounts' && <AccountsManager onToast={addToast} />}
       </div>
 
 
@@ -1055,10 +1077,6 @@ export const App: React.FC = () => {
           await reloadConversations();
         }}
       />
-
-      {/* Skills */}
-      <SkillsManager isOpen={skillsOpen} onClose={() => setSkillsOpen(false)} onToast={addToast} />
-      <McpManager isOpen={mcpOpen} onClose={() => setMcpOpen(false)} onToast={addToast} />
 
       {/* Codex Publish Confirmation */}
       {codexPublishDialog && (

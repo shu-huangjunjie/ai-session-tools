@@ -9,6 +9,7 @@ fn manager(state: &AppState) -> McpManager {
     McpManager::new(
         &state.paths.claude_json(),
         &state.paths.codex_home(),
+        &state.paths.gemini_home().join("config").join("mcp_config.json"),
         &state.paths.data,
         &state.paths.backups,
     )

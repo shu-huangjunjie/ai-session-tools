@@ -135,6 +135,20 @@ pub fn run() {
             commands::delete_mcp_server,
             commands::copy_mcp_server,
 
+            // Accounts (Codex / Claude / Antigravity, kept apart)
+            commands::list_accounts,
+            commands::save_current_account,
+            commands::import_account_file,
+            commands::login_account,
+            commands::import_account_tokens,
+            commands::cancel_account_login,
+            commands::switch_account,
+            commands::delete_account,
+            commands::refresh_account_quota,
+            commands::refresh_all_account_quotas,
+            commands::upsert_claude_provider,
+            commands::import_cc_switch_claude_providers,
+
             // Importers
             commands::preview_import,
             commands::execute_import,
@@ -149,6 +163,7 @@ pub fn run() {
             commands::get_app_paths,
             commands::pick_save_path,
             commands::pick_open_path,
+            commands::pick_auth_json_path,
             commands::pick_folder_path,
         ])
         .run(tauri::generate_context!())

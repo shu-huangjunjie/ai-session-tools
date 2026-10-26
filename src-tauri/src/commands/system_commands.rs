@@ -214,6 +214,32 @@ pub async fn pick_open_path(initial_dir: Option<String>) -> Result<Option<String
     }
 }
 
+/// 选择要导入的 Codex 登录文件 `auth.json`。
+#[tauri::command]
+pub async fn pick_auth_json_path(initial_dir: Option<String>) -> Result<Option<String>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let env = [("CV_DIALOG_DIR", self::initial_dir(initial_dir))];
+        run_blocking(move || {
+            run_dialog(
+                "$dialog = New-Object System.Windows.Forms.OpenFileDialog; \
+                 $dialog.Title = '选择 Codex 登录文件 auth.json'; \
+                 $dialog.Filter = 'Codex 登录文件 (auth.json)|auth.json;*.json|所有文件 (*.*)|*.*'; \
+                 $dialog.Multiselect = $false; \
+                 if ($env:CV_DIALOG_DIR) { $dialog.InitialDirectory = $env:CV_DIALOG_DIR };",
+                "$dialog.FileName",
+                &env,
+            )
+        })
+        .await
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = initial_dir;
+        Ok(None)
+    }
+}
+
 #[tauri::command]
 pub async fn pick_folder_path(
     window: tauri::WebviewWindow,

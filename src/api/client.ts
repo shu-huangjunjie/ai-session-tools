@@ -1,4 +1,7 @@
 import {
+  AccountClient,
+  AccountsState,
+  AccountView,
   AntigravityCandidate,
   AntigravityProject,
   AntigravityPublishPreview,
@@ -8,6 +11,7 @@ import {
   AppPathsInfo,
   CanonicalMessage,
   ClaudeCandidate,
+  ClaudeProviderInput,
   ClaudeProject,
   ClaudePublishPreview,
   ClaudePublishResult,
@@ -24,12 +28,13 @@ import {
   ConversationSummary,
   FolderPin,
   ImportPreview,
+  ImportResult,
   McpClient,
   McpCopyOutcome,
   McpLocation,
   McpServerEntry,
   McpSpec,
-  ImportResult,
+  QuotaRefreshFailure,
   ResetResult,
   ResetScope,
   SkillClient,
@@ -275,6 +280,54 @@ export const api = {
   /** Copies a server into the other client, converting the format; `overwrite` replaces an enabled entry. */
   copyMcpServer: (from: McpClient, name: string, to: McpClient, overwrite: boolean) =>
     invokeTauri<McpCopyOutcome>('copy_mcp_server', { from, name, to, overwrite }),
+
+  // Accounts. Codex, Claude and Antigravity are kept apart: every call names its client.
+  // Tokens never leave the backend; the UI only sees identities and quota.
+  listAccounts: (client: AccountClient) => invokeTauri<AccountsState>('list_accounts', { client }),
+
+  /** Saves the client's current login; returns the account id. */
+  saveCurrentAccount: (client: AccountClient) => invokeTauri<string>('save_current_account', { client }),
+
+  /** Codex only: imports an `auth.json`. */
+  importAccountFile: (client: AccountClient, path: string) => invokeTauri<string>('import_account_file', { client, path }),
+
+  pickAuthJsonPath: (initialDir?: string) =>
+    invokeTauri<string | null>('pick_auth_json_path', { initialDir: initialDir || null }),
+
+  /** Runs the official CLI login in a separate folder (opens the browser); returns the new account id. */
+  loginAccount: (client: AccountClient) => invokeTauri<string>('login_account', { client }),
+
+  /**
+   * Calls back with the Google authorization link while an Antigravity sign-in waits, for opening it by hand.
+   * Returns a function that stops listening.
+   */
+  onAccountLoginUrl: async (callback: (url: string) => void): Promise<() => void> => {
+    if (!isTauri) return () => {};
+    const { listen } = await import('@tauri-apps/api/event');
+    return listen<string>('account-login-url', (event) => callback(event.payload));
+  },
+
+  /** Imports Antigravity refresh tokens (one per line, or account JSON). */
+  importAccountTokens: (client: AccountClient, text: string) =>
+    invokeTauri<{ imported: number; failures: string[] }>('import_account_tokens', { client, text }),
+
+  cancelAccountLogin: () => invokeTauri<void>('cancel_account_login'),
+
+  /** Returns whether the client app was restarted. */
+  switchAccount: (client: AccountClient, id: string, restart: boolean) =>
+    invokeTauri<boolean>('switch_account', { client, id, restart }),
+
+  deleteAccount: (client: AccountClient, id: string) => invokeTauri<void>('delete_account', { client, id }),
+
+  refreshAccountQuota: (client: AccountClient, id: string) => invokeTauri<void>('refresh_account_quota', { client, id }),
+
+  refreshAllAccountQuotas: (client: AccountClient) =>
+    invokeTauri<QuotaRefreshFailure[]>('refresh_all_account_quotas', { client }),
+
+  upsertClaudeProvider: (input: ClaudeProviderInput) => invokeTauri<string>('upsert_claude_provider', { input }),
+
+  /** Reads cc-switch's Claude relays (read-only); returns how many were added. */
+  importCcSwitchClaudeProviders: () => invokeTauri<number>('import_cc_switch_claude_providers'),
 };
 
 /** Tauri rejects with a plain string; other failures arrive as Error objects. */
@@ -388,10 +441,16 @@ pub fn discover(custom_root: Option<&Path>) -> Result<AppPaths, std::io::Error> 
 };
 
 // Skills for the browser preview, keyed by folder path.
-const MOCK_SKILL_ROOTS: Record<SkillClient, { root: string; disabled: string }> = {
+const MOCK_SKILL_ROOTS: Record<SkillClient, { root: string; disabled: string; system?: string }> = {
   claude: { root: 'C:\\Users\\Demo\\.claude\\skills', disabled: 'C:\\Users\\Demo\\.claude\\skills-disabled' },
-  codex: { root: 'C:\\Users\\Demo\\.codex\\skills', disabled: 'C:\\Users\\Demo\\.codex\\skills-disabled' },
+  codex: { root: 'C:\\Users\\Demo\\.codex\\skills', disabled: 'C:\\Users\\Demo\\.codex\\skills-disabled', system: 'C:\\Users\\Demo\\.codex\\skills\\.system' },
+  antigravity: {
+    root: 'C:\\Users\\Demo\\.gemini\\config\\skills',
+    disabled: 'C:\\Users\\Demo\\.gemini\\config\\skills-disabled',
+    system: 'C:\\Users\\Demo\\.gemini\\antigravity\\builtin\\skills',
+  },
 };
+const MOCK_SKILL_CLIENTS: SkillClient[] = ['claude', 'codex', 'antigravity'];
 const MOCK_LIBRARY = 'E:\\skills\\claude';
 
 function mockSkill(dir: string, folder: string, description: string, extra: Partial<SkillEntry> = {}): SkillEntry {
@@ -423,6 +482,7 @@ const MOCK_SKILLS: SkillEntry[] = [
   }),
   mockSkill(MOCK_SKILL_ROOTS.claude.disabled, 'old-notes', '旧的笔记整理技能。', { enabled: false }),
   mockSkill(`${MOCK_SKILL_ROOTS.codex.root}\\.system`, 'imagegen', 'Generate or edit raster images.', { system: true }),
+  mockSkill(MOCK_SKILL_ROOTS.antigravity.system!, 'antigravity_guide', 'Answers questions about using Antigravity.', { system: true }),
 ];
 
 const parentDir = (path: string) => path.slice(0, path.lastIndexOf('\\'));
@@ -431,6 +491,7 @@ const parentDir = (path: string) => path.slice(0, path.lastIndexOf('\\'));
 const MOCK_MCP_PATHS: Record<McpClient, string> = {
   claude: 'C:\\Users\\Demo\\.claude.json',
   codex: 'C:\\Users\\Demo\\.codex\\config.toml',
+  antigravity: 'C:\\Users\\Demo\\.gemini\\config\\mcp_config.json',
 };
 
 function mockMcp(client: McpClient, name: string, spec: McpSpec, extra: Partial<McpServerEntry> = {}): McpServerEntry {
@@ -454,10 +515,49 @@ const MOCK_MCP: McpServerEntry[] = [
   mockMcp('claude', 'docs-search', { type: 'http', url: 'https://example.com/mcp', headers: { Authorization: 'Bearer demo-token' } }, { enabled: false }),
   mockMcp('codex', 'pencil', { command: 'C:\\Tools\\pencil.exe', args: ['--app', 'desktop'] }, { cc_switch: true }),
   mockMcp('codex', 'node_repl', { command: 'node.exe', args: ['repl.js'], env: { CODEX_HOME: 'C:\\Users\\Demo\\.codex' } }, { read_only: true }),
+  mockMcp('antigravity', 'blender', { command: 'E:\\tools\\blender-mcp\\venv\\Scripts\\blender-mcp.exe', args: [] }),
 ];
 
+// Codex accounts for the browser preview.
+const hoursFromNow = (h: number) => new Date(Date.now() + h * 3600000).toISOString();
+const MOCK_ACCOUNTS: Record<AccountClient, AccountView[]> = {
+  codex: [
+    {
+      id: 'cx-1', email: 'work@example.com', plan_type: 'pro', is_current: true, has_quota: true,
+      added_at: hoursFromNow(-200), last_used_at: hoursFromNow(-2), quota_updated_at: hoursFromNow(-0.1),
+      quota: { plan_type: 'pro', windows: [
+        { kind: 'primary', used_percent: 38, window_minutes: 300, resets_at: hoursFromNow(2.5) },
+        { kind: 'secondary', used_percent: 64, window_minutes: 10080, resets_at: hoursFromNow(70) },
+      ] },
+    },
+    { id: 'cx-2', email: 'old@example.com', plan_type: 'free', is_current: false, has_quota: true, added_at: hoursFromNow(-500), quota_error: 'token 已失效，请用这个账号重新登录' },
+  ],
+  claude: [
+    {
+      id: 'cl-1', kind: 'oauth', email: 'me@example.com', plan_type: 'max', detail: 'Personal', is_current: false, has_quota: true,
+      added_at: hoursFromNow(-80), quota_updated_at: hoursFromNow(-0.5),
+      quota: { plan_type: 'max', windows: [
+        { kind: 'five_hour', used_percent: 12, window_minutes: 300, resets_at: hoursFromNow(3) },
+        { kind: 'seven_day', used_percent: 41, window_minutes: 10080, resets_at: hoursFromNow(90) },
+        { kind: 'seven_day_opus', label: 'Opus', used_percent: 55, window_minutes: 10080, resets_at: hoursFromNow(90) },
+      ] },
+    },
+    { id: 'cl-2', kind: 'provider', name: 'CloudHabitat', detail: 'https://ai.example.com · claude-sonnet-4-6', is_current: true, has_quota: false, added_at: hoursFromNow(-30) },
+  ],
+  antigravity: [
+    {
+      id: 'ag-1', email: 'user@gmail.com', name: 'User', plan_type: 'Google AI Pro', is_current: true, has_quota: true,
+      added_at: hoursFromNow(-300), quota_updated_at: hoursFromNow(-0.2),
+      quota: { plan_type: 'Google AI Pro', windows: [
+        { kind: 'claude-sonnet', label: 'Claude Sonnet 4.5', used_percent: 100, resets_at: hoursFromNow(4) },
+        { kind: 'gemini-3-pro', label: 'Gemini 3 Pro', used_percent: 20, resets_at: hoursFromNow(4) },
+      ] },
+    },
+  ],
+};
+
 function mockMcpLocations(): McpLocation[] {
-  return (['claude', 'codex'] as McpClient[]).map((client) => ({
+  return (['claude', 'codex', 'antigravity'] as McpClient[]).map((client) => ({
     client,
     config_path: MOCK_MCP_PATHS[client],
     exists: true,
@@ -468,7 +568,7 @@ function mockMcpLocations(): McpLocation[] {
 
 function mockSkillLocations(libraries: string[]): SkillLocation[] {
   const linked = (target: string) =>
-    (['claude', 'codex'] as SkillClient[]).filter((client) =>
+    MOCK_SKILL_CLIENTS.filter((client) =>
       MOCK_SKILLS.some(
         (s) =>
           s.link_target === target &&
@@ -476,7 +576,7 @@ function mockSkillLocations(libraries: string[]): SkillLocation[] {
       )
     );
   const inDirs = (...dirs: string[]) => MOCK_SKILLS.filter((s) => dirs.includes(parentDir(s.path)));
-  const clients = (['claude', 'codex'] as SkillClient[]).map((client) => ({
+  const clients = MOCK_SKILL_CLIENTS.map((client) => ({
     kind: client,
     root: MOCK_SKILL_ROOTS[client].root,
     disabled_root: MOCK_SKILL_ROOTS[client].disabled,
@@ -484,7 +584,7 @@ function mockSkillLocations(libraries: string[]): SkillLocation[] {
     skills: inDirs(
       MOCK_SKILL_ROOTS[client].root,
       MOCK_SKILL_ROOTS[client].disabled,
-      `${MOCK_SKILL_ROOTS[client].root}\\.system`
+      MOCK_SKILL_ROOTS[client].system ?? ''
     ).map((s) => ({ ...s })),
   }));
   return [
@@ -526,7 +626,10 @@ async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Promi
     case 'set_skill_enabled': {
       const skill = MOCK_SKILLS.find((s) => s.path === args?.path);
       if (!skill) throw '技能不存在';
-      const client = (['claude', 'codex'] as SkillClient[]).find((c) => skill.path.includes(c === 'claude' ? '.claude' : '.codex'))!;
+      const client = MOCK_SKILL_CLIENTS.find((c) =>
+        [MOCK_SKILL_ROOTS[c].root, MOCK_SKILL_ROOTS[c].disabled].includes(parentDir(skill.path))
+      );
+      if (!client) throw '技能库中的技能不直接被加载';
       const enabled = args?.enabled as boolean;
       skill.enabled = enabled;
       skill.path = `${enabled ? MOCK_SKILL_ROOTS[client].root : MOCK_SKILL_ROOTS[client].disabled}\\${skill.folder_name}`;
@@ -552,6 +655,46 @@ async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Promi
       MOCK_SKILLS.push(link);
       return link.path as unknown as T;
     }
+    case 'list_accounts': {
+      const client = args?.client as AccountClient;
+      const accounts = MOCK_ACCOUNTS[client];
+      const current = accounts.find((a) => a.is_current);
+      return {
+        auth_path: { codex: 'C:\\Users\\Demo\\.codex\\auth.json', claude: 'C:\\Users\\Demo\\.claude', antigravity: 'C:\\Users\\Demo\\AppData\\Roaming\\Antigravity\\User\\globalStorage\\state.vscdb' }[client],
+        current: current ? { kind: current.kind, email: current.email, name: current.name, plan_type: current.plan_type, saved: true } : null,
+        current_note: null,
+        notes: [],
+        accounts: accounts.map((a) => ({ ...a })),
+      } as unknown as T;
+    }
+    case 'switch_account': {
+      const accounts = MOCK_ACCOUNTS[args?.client as AccountClient];
+      if (!accounts.some((a) => a.id === args?.id)) throw '账号不存在';
+      for (const a of accounts) a.is_current = a.id === args?.id;
+      return false as unknown as T;
+    }
+    case 'delete_account': {
+      const accounts = MOCK_ACCOUNTS[args?.client as AccountClient];
+      const index = accounts.findIndex((a) => a.id === args?.id);
+      if (index < 0) throw '账号不存在';
+      accounts.splice(index, 1);
+      return undefined as T;
+    }
+    case 'refresh_account_quota':
+      return undefined as T;
+    case 'refresh_all_account_quotas':
+      return [] as unknown as T;
+    case 'save_current_account':
+      return 'mock' as unknown as T;
+    case 'import_cc_switch_claude_providers':
+      return 0 as unknown as T;
+    case 'login_account':
+    case 'import_account_file':
+    case 'import_account_tokens':
+    case 'upsert_claude_provider':
+      throw '浏览器预览中不可用';
+    case 'pick_auth_json_path':
+      return null as unknown as T;
     case 'list_mcp_servers':
       return mockMcpLocations() as unknown as T;
     case 'upsert_mcp_server': {

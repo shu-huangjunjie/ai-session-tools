@@ -84,6 +84,14 @@ impl AppPaths {
             .unwrap_or_else(|| PathBuf::from(".gemini").join("antigravity"))
     }
 
+    /// `~/.gemini`：Antigravity 的全局配置在其中的 `config`（技能、MCP），内置技能在
+    /// `antigravity/builtin/skills`。
+    pub fn gemini_home(&self) -> PathBuf {
+        dirs::home_dir()
+            .map(|h| h.join(".gemini"))
+            .unwrap_or_else(|| PathBuf::from(".gemini"))
+    }
+
     /// Codex 数据根目录：与 Codex 一致，优先 `CODEX_HOME`，否则为 `~/.codex`。
     pub fn codex_home(&self) -> PathBuf {
         if let Ok(env_home) = env::var("CODEX_HOME") {

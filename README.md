@@ -1,12 +1,12 @@
 # AI 会话工具（AI Session Tools）
 
-Windows 本地 AI 会话管理工具，支持 **Codex、Claude 和 Antigravity** 的会话恢复、搜索、置顶、备份与导出。基于 **Tauri v2 + React 18 + TypeScript + Rust** 构建。
+Windows 本地 AI 工具管理器，支持 **Codex、Claude 和 Antigravity** 的会话恢复、搜索、置顶、备份与导出，以及技能、MCP 服务器和多账号切换的统一管理。基于 **Tauri v2 + React 18 + TypeScript + Rust** 构建。
 
 桌面程序仍显示原名称 **Context Vault**，可执行文件为 `Context-Vault.exe`。
 
 ## 直接下载使用（Windows x64）
 
-从 [GitHub Releases](https://github.com/shu-huangjunjie/ai-session-tools/releases/latest) 下载 `AI-Session-Tools-0.1.4-Windows-x64.zip`，解压到可写目录后双击 `Context-Vault.exe`。整个文件夹可以一起移动，`data/` 保存本地数据，`backups/` 保存备份。
+从 [GitHub Releases](https://github.com/shu-huangjunjie/ai-session-tools/releases/latest) 下载 `AI-Session-Tools-0.1.5-Windows-x64.zip`，解压到可写目录后双击 `Context-Vault.exe`。整个文件夹可以一起移动，`data/` 保存本地数据，`backups/` 保存备份。
 
 需要 Windows 10/11 和 Microsoft Edge WebView2 运行时。更新旧版时，先退出程序，只替换 `Context-Vault.exe`，保留自己的 `data/` 和 `backups/` 文件夹。
 
@@ -44,14 +44,23 @@ Windows 本地 AI 会话管理工具，支持 **Codex、Claude 和 Antigravity**
 - [x] **会话清理**：
   - 会话支持置顶与取消置顶，可通过行内图钉或右键菜单操作；置顶会话集中显示在当前来源列表顶部，重启和重新扫描后保留；
   - 工作文件夹也支持独立置顶，可通过文件夹标题旁的图钉或右键菜单操作；“置顶文件夹”排在普通项目之前，按来源保存，重启和重新扫描后保留；
-  - 顶部“清空数据库”直接显示全部来源的会话、消息和删除记录数量，确认后自动备份再清空，包含归档会话；
+  - 会话页顶部的“清空数据库”直接显示全部来源的会话、消息和删除记录数量，确认后自动备份再清空，包含归档会话；
   - 清空后保留空列表，可自行重新扫描导入；客户端的原始会话保留；
   - 侧栏保留批量删除，支持右键“重命名”与“删除”，以及 `F2` 与 `Delete` 快捷键；
-- [x] **技能管理**（顶栏“技能”按钮）：
-  - 列出 Claude（`~/.claude/skills`）与 Codex（`~/.codex/skills`）的技能，显示 SKILL.md 中的名称与简介，可预览全文、打开文件夹或用 VS Code 打开；Codex 的 `.system` 内置技能只读；
-  - 登记“技能库”文件夹，把库中的技能以目录联接挂载到 Claude 或 Codex、或取消挂载，文件只在库中保存一份；已挂载的库技能需先取消挂载才能删除；
-  - 新建技能（生成 SKILL.md 模板，可同时挂载）；停用会把技能移到同级 `skills-disabled`，客户端不再加载，可随时启用；
+- [x] **技能管理**（左侧“技能”页）：
+  - Claude（`~/.claude/skills`）、Codex（`~/.codex/skills`）和 Antigravity（`~/.gemini/config/skills`）的技能合成一张表，同名文件夹为一行，每个客户端一个开关（参考 cc-switch）；「全部开启」一次打开某个客户端的全部技能；
+  - 可预览 SKILL.md、打开文件夹或用 VS Code 打开；Codex 的 `.system` 与 Antigravity 的内置技能只读；
+  - 可登记“技能库”文件夹，库中的技能以目录联接挂载到客户端，文件只保存一份；停用会把技能移到同级 `skills-disabled`，客户端不再加载；
   - 删除联接只移除联接本身，删除真实技能文件夹则移入回收站；后端只处理客户端技能目录与已登记技能库正下方的文件夹；
+- [x] **MCP 管理**（“MCP”页）：
+  - Claude Code（`~/.claude.json`）、Codex（`~/.codex/config.toml`）和 Antigravity（`~/.gemini/config/mcp_config.json`）的 MCP 服务器合成一张表，每个客户端一个开关，可新建、编辑和删除；「全部开启」一次启用某个客户端的全部服务器；
+  - Codex 与 Antigravity 用各自原生的停用标记；Claude Code 没有停用开关，停用的条目暂存在本程序数据目录，启用时写回；
+  - 每次写入前备份到 `backups/mcp`；`~/.claude.json` 只改 `mcpServers`，`config.toml` 保留注释；
+- [x] **多账号切换**（“账号”页）：
+  - Codex（ChatGPT 登录）、Claude Code（官方订阅与中转供应商）和 Antigravity 各自保存多个账号，按“官方订阅 / 中转供应商”分组显示，切换时只改对应客户端的登录文件；切换 Codex、Antigravity 时可自动关闭并重启客户端；
+  - 显示剩余额度：Codex 与 Claude 的 5 小时 / 每周额度，Antigravity 按模型家族汇总，可展开查看每个模型；
+  - 「添加账号」：浏览器登录（Antigravity 用 Google 授权，不用先在 Antigravity 里登录）、粘贴 refresh token、导入 `auth.json`、手动添加中转或从 cc-switch 导入，以及保存当前登录；
+  - 正在使用的 Codex、Claude 账号不由本程序刷新 token，避免把客户端挤下线；查询额度走 Windows 系统代理与证书；
 - [x] **导入与导出**：
   - 支持 ChatGPT 官方导出（ZIP / `conversations.json`）、Markdown 与通用 JSON/JSONL；
   - 支持将当前会话一键导出为 Markdown 与 JSON；
@@ -89,13 +98,18 @@ ai-session-tools/
 ├── src/                       # TypeScript 前端 (React 18 + Tailwind)
 │   ├── api/                   # Tauri IPC 调用层与 Mock 桥接
 │   ├── components/            # 主界面与功能组件
-│   │   ├── common/            # 通用组件 (Modal, Button, Toast)
-│   │   ├── Header.tsx         # 顶部控制台看板
-│   │   ├── Sidebar.tsx        # 左侧边栏与项目树
+│   │   ├── common/            # 通用组件 (Modal, Button, Toast, Segmented, Switch)
+│   │   ├── NavRail.tsx        # 左侧导航：会话、技能、MCP、账号
+│   │   ├── SessionsHeader.tsx # 会话页顶栏：来源切换、扫描、发布与数据库操作
+│   │   ├── Sidebar.tsx        # 会话列表与项目树
 │   │   ├── ChatView.tsx       # 会话查看中心
 │   │   ├── MessageBubble.tsx  # 消息卡片与代码渲染
 │   │   ├── CodexRecoveryModal.tsx # 扫描恢复弹窗
-│   │   └── ImportModal.tsx    # 历史导入弹窗
+│   │   ├── ImportModal.tsx    # 历史导入弹窗
+│   │   ├── SkillsManager.tsx  # 技能页
+│   │   ├── McpManager.tsx     # MCP 页
+│   │   ├── AccountsManager.tsx # 账号页
+│   │   └── AccountAddDialog.tsx # 添加账号对话框
 │   ├── styles/                # 科技风样式
 │   ├── types/                 # 强类型定义
 │   └── utils/                 # 防抖、日期格式化等工具
@@ -104,7 +118,7 @@ ai-session-tools/
 │   │   ├── commands/          # Tauri IPC 接口封装
 │   │   ├── domain/            # 业务实体与枚举
 │   │   ├── persistence/       # SQLite 数据库管理与 Repository
-│   │   ├── services/          # Codex 扫描、发布、进程控制、VS Code 唤起
+│   │   ├── services/          # 会话扫描与发布、技能、MCP、账号切换、进程控制
 │   │   ├── importers/         # 导入解析器
 │   │   ├── paths.rs           # 全相对路径与便携路径解析
 │   │   └── main.rs            # 应用程序主入口

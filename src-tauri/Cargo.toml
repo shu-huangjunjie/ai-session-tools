@@ -1,6 +1,6 @@
 [package]
 name = "context-vault"
-version = "0.1.4"
+version = "0.1.5"
 description = "Windows 本地 Codex 会话恢复与整理工具 (TypeScript + Rust)"
 edition = "2021"
 
@@ -35,4 +35,4 @@ dirs = "5.0"
 thiserror = "1.0"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_Networking_WinHttp"] }

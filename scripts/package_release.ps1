@@ -1,4 +1,4 @@
-# Build and package a clean portable release plus an allowlisted source archive.
+﻿# Build and package a clean portable release plus an allowlisted source archive.
 param([switch]$SkipBuild)
 
 $ErrorActionPreference = 'Stop'
@@ -42,12 +42,10 @@ AI 会话工具 $version - Windows x64 便携版（Context Vault）
 请保留原目录中的 data、backups 等文件夹。首次运行会自动备份并升级旧数据库。
 
 本版更新
-- 新增“技能”入口，可查看 Claude、Codex 的技能列表和 SKILL.md 全文。
-- 支持登记技能库、挂载与取消挂载、新建技能和启用/停用；Codex 内置技能只读。
-- 会话及工作文件夹支持分别置顶与取消置顶，重启后保留。
-- 清空数据库支持数量预览、确认和自动备份。
-- 批量保存支持带地址栏的目录选择窗口，并记住上次成功保存位置。
-- 修复通过应用打开 VS Code 时的 Windows 路径前缀兼容问题。
+- 界面改为左侧导航，会话、技能、MCP、账号各占一页；更换了新图标。
+- 技能与 MCP 参考 cc-switch 统一管理：Claude、Codex、Antigravity 每个客户端一个开关，支持「全部开启」。
+- 新增多账号切换：Codex、Claude Code（官方订阅与中转）、Antigravity，按“官方订阅 / 中转”分组，显示剩余额度。
+- 「添加账号」支持浏览器登录（Antigravity 用 Google 授权）、粘贴 Token、导入 auth.json、添加中转和导入当前登录。
 "@
 [IO.File]::WriteAllText((Join-Path $portableStage '使用说明.txt'), $instructions, [Text.UTF8Encoding]::new($false))
 

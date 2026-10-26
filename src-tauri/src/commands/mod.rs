@@ -1,3 +1,4 @@
+pub mod account_commands;
 pub mod antigravity_commands;
 pub mod claude_commands;
 pub mod codex_commands;
@@ -7,6 +8,7 @@ pub mod mcp_commands;
 pub mod skill_commands;
 pub mod system_commands;
 
+pub use account_commands::*;
 pub use antigravity_commands::*;
 pub use claude_commands::*;
 pub use codex_commands::*;

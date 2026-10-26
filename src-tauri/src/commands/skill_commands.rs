@@ -6,7 +6,7 @@ use crate::AppState;
 
 /// `libraries` 是用户登记的技能库文件夹；写操作只接受这些目录和客户端技能目录中的技能。
 fn manager(state: &AppState, libraries: &[String]) -> SkillManager {
-    SkillManager::new(&state.paths.claude_home(), &state.paths.codex_home(), libraries)
+    SkillManager::new(&state.paths.claude_home(), &state.paths.codex_home(), &state.paths.gemini_home(), libraries)
 }
 
 #[tauri::command]
@@ -21,10 +21,11 @@ pub async fn list_skills(
         let cc_switch = CcSwitchState::detect();
         for location in &mut locations {
             for skill in &mut location.skills {
+                // cc-switch 的数据库没有 Antigravity 的开关列，不标注。
                 skill.cc_switch = cc_switch.skill(&skill.folder_name).and_then(|apps| match location.kind {
                     SkillLocationKind::Claude => Some(apps.claude),
                     SkillLocationKind::Codex => Some(apps.codex),
-                    SkillLocationKind::Library => None,
+                    SkillLocationKind::Antigravity | SkillLocationKind::Library => None,
                 });
             }
         }

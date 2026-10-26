@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.5 (2026-10-26)
+
+- Redesign the window around a left navigation rail with a full page each for Sessions, Skills, MCP and Accounts; language and theme sit at the bottom of the rail. Clearing the local database moved to the Sessions page header. New app icon (a chat bubble with a restore arrow).
+- Skills: one list for Claude, Codex and Antigravity (`~/.gemini/config/skills`), one row per skill folder name and one switch per client, like cc-switch. Turning a switch on links the skill into that client's folder; turning it off disables it there. "全部开启" turns on every skill for one client. Codex `.system` and Antigravity built-in skills are read-only.
+- MCP: the servers of Claude Code (`~/.claude.json`), Codex (`~/.codex/config.toml`) and Antigravity (`~/.gemini/config/mcp_config.json`) in one list with one switch per client. Editing or deleting a server applies to every client that has it; "全部开启" enables every server for one client. Codex and Antigravity keep their native disable flags; Claude Code has none, so its disabled servers wait in the app's data folder (`mcp-disabled/claude.json`). Each file is backed up to `backups/mcp` before a write and read again first if another program changed it; `~/.claude.json` only has `mcpServers` changed, and `config.toml` keeps its comments.
+- Accounts: save and switch Codex (ChatGPT) accounts, Claude Code official subscriptions and relay providers, and Antigravity accounts. Each client's accounts are stored in their own file under `accounts/`, and switching changes only that client's login files. Accounts are listed in two groups, official subscriptions and relays, with the current login in its group. Switching Codex or Antigravity can close and reopen the client.
+- Quota: Codex 5-hour and weekly windows, Claude 5-hour, weekly and per-model windows, and Antigravity per model, summed up by family (Claude, Gemini Pro, Gemini Flash, Gemini Image, GPT-OSS) with every model one click away. The app never refreshes the token of the Codex or Claude account in use, because their refresh tokens work only once; other accounts are refreshed when their access token expires.
+- Add accounts in one dialog: browser sign-in (Codex and Claude through their official command in a separate folder, leaving the current login alone; Antigravity through Google OAuth, without signing in to Antigravity first), refresh tokens or account JSON pasted for Antigravity, a Codex `auth.json` file, Claude relays typed in or imported from cc-switch, and the current login. When switching to an Antigravity account added this way, its login entries are written in Antigravity's own format.
+- Requests for quota and token refresh go through Windows WinHTTP, so they use the system proxy and certificates.
+- Dialog headers get their missing vertical padding.
+
 ## 0.1.4 (2026-10-23)
 
 - Add skill management (header button "技能"). It lists the Claude (`~/.claude/skills`) and Codex (`$CODEX_HOME` or `~/.codex/skills`) skills with their SKILL.md name and description, previews SKILL.md, and opens a skill in Explorer or VS Code. Codex built-in skills under `.system` are shown read-only.

@@ -1,9 +1,11 @@
-//! Claude Code / Codex 的 MCP 服务器管理：列出、新建、编辑、启用/停用、删除和跨客户端复制。
+//! Claude Code / Codex / Antigravity 的 MCP 服务器管理：列出、新建、编辑、启用/停用、删除和跨客户端复制。
 //!
 //! 配置文件就是唯一的数据来源：
 //! - Claude Code：`~/.claude.json` 顶层的 `mcpServers`（用户级）。该文件没有停用开关，
 //!   停用的条目移到本程序数据目录的 `mcp-disabled/claude.json`，启用时写回。
 //! - Codex：`~/.codex/config.toml` 的 `[mcp_servers.<名字>]`，停用用 Codex 原生的 `enabled = false`。
+//! - Antigravity：`~/.gemini/config/mcp_config.json` 的 `mcpServers`，写法与 Claude 相同但不写 `type`，
+//!   远程地址也可写作旧键 `serverUrl`；停用用它原生的 `"disabled": true`，不支持 SSE。
 //!
 //! 界面统一用 Claude 的 JSON 写法（type、command、args、env、cwd、url、headers）表示一个服务器，
 //! 写入 Codex 时转换为 TOML：不写 `type`，headers 写作 `http_headers`，且只写所选传输方式的字段，
@@ -53,12 +55,16 @@ const CODEX_REMOTE_FIELDS: &[&str] = &[
     "bearer_token_env_var",
     "oauth_resource",
 ];
+/// Antigravity 认识的字段；复制到 Antigravity 时只保留这些，`disabled` 由开关管理。
+const ANTIGRAVITY_STDIO_FIELDS: &[&str] = &["command", "args", "env", "disabledTools"];
+const ANTIGRAVITY_REMOTE_FIELDS: &[&str] = &["url", "headers", "disabledTools"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpClient {
     Claude,
     Codex,
+    Antigravity,
 }
 
 impl McpClient {
@@ -66,6 +72,7 @@ impl McpClient {
         match self {
             McpClient::Claude => "Claude",
             McpClient::Codex => "Codex",
+            McpClient::Antigravity => "Antigravity",
         }
     }
 }
@@ -106,16 +113,19 @@ pub struct McpCopyOutcome {
 pub struct McpManager {
     claude_json: PathBuf,
     codex_home: PathBuf,
+    antigravity_config: PathBuf,
     stash_dir: PathBuf,
     backups: PathBuf,
 }
 
 impl McpManager {
-    /// `data_dir` 存放 Claude 停用条目，`backups` 下的 `mcp` 子目录存放配置备份。
-    pub fn new(claude_json: &Path, codex_home: &Path, data_dir: &Path, backups: &Path) -> Self {
+    /// `antigravity_config` 是 Antigravity 的 `mcp_config.json`；`data_dir` 存放 Claude 停用条目，
+    /// `backups` 下的 `mcp` 子目录存放配置备份。
+    pub fn new(claude_json: &Path, codex_home: &Path, antigravity_config: &Path, data_dir: &Path, backups: &Path) -> Self {
         Self {
             claude_json: claude_json.to_path_buf(),
             codex_home: codex_home.to_path_buf(),
+            antigravity_config: antigravity_config.to_path_buf(),
             stash_dir: data_dir.join("mcp-disabled"),
             backups: backups.join("mcp"),
         }
@@ -130,13 +140,15 @@ impl McpManager {
     }
 
     pub fn list(&self, cc_switch: &CcSwitchState) -> Vec<McpLocation> {
+        // cc-switch 的数据库没有 Antigravity 的开关列，不标注。
         let mark = |client: McpClient, name: &str| {
-            cc_switch.mcp_servers.get(name).map(|apps| match client {
-                McpClient::Claude => apps.claude,
-                McpClient::Codex => apps.codex,
+            cc_switch.mcp_servers.get(name).and_then(|apps| match client {
+                McpClient::Claude => Some(apps.claude),
+                McpClient::Codex => Some(apps.codex),
+                McpClient::Antigravity => None,
             })
         };
-        let mut locations = vec![self.list_claude(), self.list_codex()];
+        let mut locations = vec![self.list_claude(), self.list_codex(), self.list_antigravity()];
         for location in &mut locations {
             for server in &mut location.servers {
                 server.cc_switch = mark(server.client, &server.name);
@@ -208,6 +220,30 @@ impl McpManager {
         }
     }
 
+    fn list_antigravity(&self) -> McpLocation {
+        let path = &self.antigravity_config;
+        let exists = path.is_file();
+        let mut servers = Vec::new();
+        let mut error = None;
+        if exists {
+            match read_json_object_or_empty(path) {
+                Ok(root) => match root.get("mcpServers") {
+                    None => {}
+                    Some(Value::Object(map)) => servers.extend(map.iter().map(|(name, native)| antigravity_entry(name, native))),
+                    Some(_) => error = Some("mcpServers 不是对象，请手动检查 mcp_config.json".into()),
+                },
+                Err(e) => error = Some(e),
+            }
+        }
+        McpLocation {
+            client: McpClient::Antigravity,
+            config_path: path.to_string_lossy().to_string(),
+            exists,
+            error,
+            servers,
+        }
+    }
+
     /// 新建（`original` 为空）或编辑一个服务器；编辑时可改名，启用状态保持不变。
     pub fn upsert(&self, client: McpClient, original: Option<&str>, name: &str, spec: &Value) -> Result<(), String> {
         if original != Some(name) {
@@ -217,7 +253,29 @@ impl McpManager {
         match client {
             McpClient::Claude => self.upsert_claude(original, name, spec),
             McpClient::Codex => self.upsert_codex(original, name, spec),
+            McpClient::Antigravity => self.upsert_antigravity(original, name, spec),
         }
+    }
+
+    fn upsert_antigravity(&self, original: Option<&str>, name: &str, spec: &Value) -> Result<(), String> {
+        let (native, _) = spec_for_antigravity(spec, false)?;
+        self.edit_antigravity(|servers| {
+            let mut native = native.clone();
+            if let Some(original) = original {
+                let old = servers
+                    .get(original)
+                    .ok_or_else(|| format!("Antigravity 中没有这个服务器：{}", original))?;
+                // 编辑保持停用状态。
+                if old.get("disabled").and_then(Value::as_bool) == Some(true) {
+                    native.insert("disabled".into(), Value::Bool(true));
+                }
+            }
+            if original != Some(name) && servers.contains_key(name) {
+                return Err(format!("Antigravity 中已有同名服务器：{}", name));
+            }
+            replace_key(servers, original.unwrap_or(name), name, Value::Object(native));
+            Ok(())
+        })
     }
 
     fn upsert_claude(&self, original: Option<&str>, name: &str, spec: &Value) -> Result<(), String> {
@@ -331,6 +389,18 @@ impl McpManager {
                 }
                 Ok(())
             }),
+            McpClient::Antigravity => self.edit_antigravity(|servers| {
+                let server = servers
+                    .get_mut(name)
+                    .and_then(Value::as_object_mut)
+                    .ok_or_else(|| format!("Antigravity 中没有这个服务器：{}", name))?;
+                if enabled {
+                    server.shift_remove("disabled");
+                } else {
+                    server.insert("disabled".into(), Value::Bool(true));
+                }
+                Ok(())
+            }),
         }
     }
 
@@ -355,6 +425,12 @@ impl McpManager {
                     .remove(name)
                     .map(|_| ())
                     .ok_or_else(|| format!("Codex 中没有这个服务器：{}", name))
+            }),
+            McpClient::Antigravity => self.edit_antigravity(|servers| {
+                servers
+                    .shift_remove(name)
+                    .map(|_| ())
+                    .ok_or_else(|| format!("Antigravity 中没有这个服务器：{}", name))
             }),
         }
     }
@@ -409,6 +485,14 @@ impl McpManager {
                 })?;
                 Ok(McpCopyOutcome { dropped_fields })
             }
+            McpClient::Antigravity => {
+                let (native, dropped_fields) = spec_for_antigravity(&source.spec, true)?;
+                self.edit_antigravity(|servers| {
+                    replace_key(servers, name, name, Value::Object(native.clone()));
+                    Ok(())
+                })?;
+                Ok(McpCopyOutcome { dropped_fields })
+            }
         }
     }
 
@@ -440,31 +524,58 @@ impl McpManager {
         atomic_write(&self.stash_path(), text.as_bytes())
     }
 
-    /// 读取 `.claude.json`，修改 `mcpServers` 后写回。文件在修改期间被其他程序改过就重来。
-    fn edit_claude<F>(&self, mut edit: F) -> Result<(), String>
+    /// 读取 `.claude.json`，修改 `mcpServers` 后写回。
+    fn edit_claude<F>(&self, edit: F) -> Result<(), String>
     where
         F: FnMut(&mut Map<String, Value>) -> Result<(), String>,
     {
-        let path = &self.claude_json;
-        if !path.is_file() {
-            return Err(format!("没有找到 {}，请先运行一次 Claude Code", path.display()));
+        if !self.claude_json.is_file() {
+            return Err(format!("没有找到 {}，请先运行一次 Claude Code", self.claude_json.display()));
         }
+        self.edit_json(&self.claude_json, "claude.json", edit)
+    }
+
+    /// 读取 Antigravity 的 `mcp_config.json`，修改 `mcpServers` 后写回；文件不存在或为空时新建。
+    fn edit_antigravity<F>(&self, edit: F) -> Result<(), String>
+    where
+        F: FnMut(&mut Map<String, Value>) -> Result<(), String>,
+    {
+        let dir = self.antigravity_config.parent().unwrap_or(Path::new("."));
+        if !dir.is_dir() {
+            return Err(format!("没有找到 Antigravity 配置目录 {}，请先运行一次 Antigravity", dir.display()));
+        }
+        self.edit_json(&self.antigravity_config, "antigravity-mcp_config.json", edit)
+    }
+
+    /// 修改 JSON 配置文件的 `mcpServers`，其他字段和键顺序不变。文件在修改期间被其他程序改过就重来。
+    fn edit_json<F>(&self, path: &Path, backup: &str, mut edit: F) -> Result<(), String>
+    where
+        F: FnMut(&mut Map<String, Value>) -> Result<(), String>,
+    {
+        let file = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         for _ in 0..WRITE_ATTEMPTS {
-            let (bytes, stamp) = read_with_stamp(path)?;
-            let mut root = parse_json_object(&bytes, path)?;
+            let (bytes, stamp) = if path.is_file() {
+                let (b, s) = read_with_stamp(path)?;
+                (b, Some(s))
+            } else {
+                (Vec::new(), None)
+            };
+            let mut root = parse_json_object_or_empty(&bytes, path)?;
             let servers = root.entry("mcpServers").or_insert_with(|| Value::Object(Map::new()));
             let servers = servers
                 .as_object_mut()
-                .ok_or_else(|| "mcpServers 不是对象，请手动检查 .claude.json".to_string())?;
+                .ok_or_else(|| format!("mcpServers 不是对象，请手动检查 {}", file))?;
             edit(servers)?;
             let mut text = serde_json::to_string_pretty(&Value::Object(root)).map_err(|e| e.to_string())?;
-            if bytes.ends_with(b"\n") {
+            if bytes.is_empty() || bytes.ends_with(b"\n") {
                 text.push('\n');
             }
-            if file_stamp(path) != Some(stamp) {
+            if file_stamp(path) != stamp {
                 continue;
             }
-            self.backup("claude.json", &bytes)?;
+            if !bytes.is_empty() {
+                self.backup(backup, &bytes)?;
+            }
             if atomic_write(path, text.as_bytes()).is_ok() {
                 return Ok(());
             }
@@ -648,6 +759,60 @@ fn codex_entry(name: &str, item: &Item) -> Option<McpServerEntry> {
     })
 }
 
+/// Antigravity 的条目转成界面统一的写法：补上 type，旧键 serverUrl 读作 url，disabled 由开关表示。
+fn antigravity_entry(name: &str, native: &Value) -> McpServerEntry {
+    let mut spec = native.as_object().cloned().unwrap_or_default();
+    if let Some(url) = spec.shift_remove("serverUrl") {
+        spec.entry("url").or_insert(url);
+    }
+    let enabled = spec.shift_remove("disabled").and_then(|v| v.as_bool()) != Some(true);
+    let transport = match spec.get("type").and_then(Value::as_str) {
+        Some("streamable-http") | None if spec.contains_key("url") => "http".to_string(),
+        Some(t) => t.to_string(),
+        None => "stdio".to_string(),
+    };
+    spec.insert("type".into(), Value::String(transport.clone()));
+    McpServerEntry {
+        client: McpClient::Antigravity,
+        name: name.to_string(),
+        transport,
+        spec: Value::Object(spec),
+        enabled,
+        read_only: false,
+        cc_switch: None,
+        raw: serde_json::to_string_pretty(&json!({ name: native })).unwrap_or_default(),
+    }
+}
+
+/// 转成 Antigravity 的写法：不写 type 和 disabled，舍弃另一种传输方式的字段；不支持 SSE。
+/// `strict` 为真（跨客户端复制）时只保留 Antigravity 认识的字段。返回条目和被舍弃的字段名。
+fn spec_for_antigravity(spec: &Value, strict: bool) -> Result<(Map<String, Value>, Vec<String>), String> {
+    let obj = spec.as_object().ok_or("服务器配置必须是 JSON 对象")?;
+    let transport = spec_transport(spec);
+    if transport == "sse" {
+        return Err("Antigravity 只支持 stdio 和 Streamable HTTP，不支持 SSE".into());
+    }
+    let (own, other) = if transport == "stdio" {
+        (ANTIGRAVITY_STDIO_FIELDS, ANTIGRAVITY_REMOTE_FIELDS)
+    } else {
+        (ANTIGRAVITY_REMOTE_FIELDS, ANTIGRAVITY_STDIO_FIELDS)
+    };
+    let mut out = Map::new();
+    let mut dropped = Vec::new();
+    for (key, value) in obj {
+        let key = key.as_str();
+        if matches!(key, "type" | "disabled" | "serverUrl") {
+            continue;
+        }
+        if (other.contains(&key) && !own.contains(&key)) || (strict && !own.contains(&key)) {
+            dropped.push(key.to_string());
+            continue;
+        }
+        out.insert(key.to_string(), value.clone());
+    }
+    Ok((out, dropped))
+}
+
 /// 复制到 Claude：只保留 Claude Code 认识的字段，返回被舍弃的字段名。
 fn spec_for_claude(spec: &Value) -> (Value, Vec<String>) {
     let transport = spec_transport(spec);
@@ -787,6 +952,19 @@ fn read_json_object(path: &Path) -> Result<Map<String, Value>, String> {
     parse_json_object(&bytes, path)
 }
 
+/// Antigravity 首次启动会建一个 0 字节的配置文件，当成没有配置。
+fn read_json_object_or_empty(path: &Path) -> Result<Map<String, Value>, String> {
+    let bytes = fs::read(path).map_err(|e| format!("读取 {} 失败：{}", path.display(), e))?;
+    parse_json_object_or_empty(&bytes, path)
+}
+
+fn parse_json_object_or_empty(bytes: &[u8], path: &Path) -> Result<Map<String, Value>, String> {
+    if String::from_utf8_lossy(bytes).trim_start_matches('\u{feff}').trim().is_empty() {
+        return Ok(Map::new());
+    }
+    parse_json_object(bytes, path)
+}
+
 fn parse_json_object(bytes: &[u8], path: &Path) -> Result<Map<String, Value>, String> {
     let text = String::from_utf8_lossy(bytes);
     match serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')) {
@@ -855,11 +1033,18 @@ mod tests {
         fn new(claude_json: &str, codex_toml: Option<&str>) -> Self {
             let root = std::env::temp_dir().join(format!("cv-mcp-{}", uuid::Uuid::new_v4()));
             fs::create_dir_all(root.join("codex")).unwrap();
+            fs::create_dir_all(root.join("gemini/config")).unwrap();
             fs::write(root.join(".claude.json"), claude_json).unwrap();
             if let Some(toml) = codex_toml {
                 fs::write(root.join("codex/config.toml"), toml).unwrap();
             }
-            let manager = McpManager::new(&root.join(".claude.json"), &root.join("codex"), &root.join("data"), &root.join("backups"));
+            let manager = McpManager::new(
+                &root.join(".claude.json"),
+                &root.join("codex"),
+                &root.join("gemini/config/mcp_config.json"),
+                &root.join("data"),
+                &root.join("backups"),
+            );
             Self { root, manager }
         }
         fn claude(&self) -> Value {
@@ -867,6 +1052,12 @@ mod tests {
         }
         fn codex(&self) -> String {
             fs::read_to_string(self.root.join("codex/config.toml")).unwrap()
+        }
+        fn agy_path(&self) -> PathBuf {
+            self.root.join("gemini/config/mcp_config.json")
+        }
+        fn agy(&self) -> Value {
+            serde_json::from_slice(&fs::read(self.agy_path()).unwrap()).unwrap()
         }
         fn servers(&self, client: McpClient) -> Vec<McpServerEntry> {
             self.manager.list(&CcSwitchState::default()).into_iter().find(|l| l.client == client).unwrap().servers
@@ -1020,11 +1211,63 @@ sandbox = "elevated"
     #[test]
     fn malformed_files_are_reported_and_left_untouched() {
         let s = Sandbox::new("{ not json", Some("mcp_servers = 3\n"));
+        fs::write(s.agy_path(), "[1]").unwrap();
         let locations = s.manager.list(&CcSwitchState::default());
         assert!(locations.iter().all(|l| l.error.is_some()));
         assert!(s.manager.upsert(McpClient::Claude, None, "a", &json!({"command": "x"})).is_err());
         assert!(s.manager.upsert(McpClient::Codex, None, "a", &json!({"command": "x"})).is_err());
         assert_eq!(fs::read_to_string(s.root.join(".claude.json")).unwrap(), "{ not json");
         assert_eq!(s.codex(), "mcp_servers = 3\n");
+        assert!(s.manager.upsert(McpClient::Antigravity, None, "a", &json!({"command": "x"})).is_err());
+        assert_eq!(fs::read_to_string(s.agy_path()).unwrap(), "[1]");
+    }
+
+    #[test]
+    fn antigravity_reads_empty_and_legacy_files_and_uses_its_disabled_flag() {
+        let s = Sandbox::new(CLAUDE, Some(CODEX));
+        // Antigravity 首次启动建的 0 字节文件当成没有配置。
+        fs::write(s.agy_path(), "").unwrap();
+        assert!(s.servers(McpClient::Antigravity).is_empty());
+        assert!(s.manager.list(&CcSwitchState::default())[2].error.is_none());
+
+        // 从 Claude 复制：不写 type，headers 保留。
+        let out = s.manager.copy(McpClient::Claude, "remote", McpClient::Antigravity, false).unwrap();
+        assert!(out.dropped_fields.is_empty());
+        assert_eq!(s.agy()["mcpServers"]["remote"], json!({"url": "https://example.com/mcp", "headers": {"Authorization": "Bearer x"}}));
+        s.manager.copy(McpClient::Claude, "pencil", McpClient::Antigravity, false).unwrap();
+        assert_eq!(s.agy()["mcpServers"]["pencil"], json!({"command": "pencil.exe", "args": ["--mcp"], "env": {}}));
+
+        s.manager.set_enabled(McpClient::Antigravity, "pencil", false).unwrap();
+        assert_eq!(s.agy()["mcpServers"]["pencil"]["disabled"], true);
+        let pencil = s.servers(McpClient::Antigravity).into_iter().find(|e| e.name == "pencil").unwrap();
+        assert!(!pencil.enabled);
+        assert!(pencil.spec.get("disabled").is_none());
+        // 编辑保持停用状态。
+        s.manager.upsert(McpClient::Antigravity, Some("pencil"), "pencil",
+            &json!({"type": "stdio", "command": "pencil.exe", "args": ["--v2"]})).unwrap();
+        assert_eq!(s.agy()["mcpServers"]["pencil"], json!({"command": "pencil.exe", "args": ["--v2"], "disabled": true}));
+        s.manager.set_enabled(McpClient::Antigravity, "pencil", true).unwrap();
+        assert!(s.agy()["mcpServers"]["pencil"].get("disabled").is_none());
+
+        // 不支持 SSE；旧键 serverUrl 读作 http。
+        assert!(s.manager.upsert(McpClient::Antigravity, None, "old", &json!({"type": "sse", "url": "https://a/sse"})).is_err());
+        fs::write(s.agy_path(), r#"{"mcpServers":{"legacy":{"serverUrl":"https://b/mcp","disabled":true}}}"#).unwrap();
+        let legacy = &s.servers(McpClient::Antigravity)[0];
+        assert_eq!((legacy.transport.as_str(), legacy.enabled), ("http", false));
+        assert_eq!(legacy.spec["url"], "https://b/mcp");
+        // 复制到 Codex 时按 Codex 的格式写。
+        s.manager.copy(McpClient::Antigravity, "legacy", McpClient::Codex, false).unwrap();
+        assert!(s.codex().contains("[mcp_servers.legacy]\nurl = \"https://b/mcp\""), "{}", s.codex());
+        s.manager.delete(McpClient::Antigravity, "legacy").unwrap();
+        assert!(s.agy()["mcpServers"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn antigravity_config_is_created_only_when_its_folder_exists() {
+        let s = Sandbox::new(CLAUDE, None);
+        s.manager.upsert(McpClient::Antigravity, None, "tool", &json!({"command": "t.exe"})).unwrap();
+        assert_eq!(s.agy()["mcpServers"]["tool"], json!({"command": "t.exe"}));
+        fs::remove_dir_all(s.root.join("gemini")).unwrap();
+        assert!(s.manager.upsert(McpClient::Antigravity, None, "x", &json!({"command": "x"})).is_err());
     }
 }

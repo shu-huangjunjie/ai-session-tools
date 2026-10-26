@@ -1,5 +1,5 @@
-/** Client that loads skills from its own skills folder. */
-export type SkillClient = 'claude' | 'codex';
+/** Client that loads skills from its own skills folder (Antigravity: `~/.gemini/config/skills`). */
+export type SkillClient = 'claude' | 'codex' | 'antigravity';
 
 /** A client skills folder, or a library folder the user registered. */
 export type SkillLocationKind = SkillClient | 'library';

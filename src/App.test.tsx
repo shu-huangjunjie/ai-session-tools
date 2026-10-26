@@ -33,6 +33,7 @@ vi.mock('./api/client', () => ({
     getCodexVisibility: vi.fn(),
     pickFolderPath: vi.fn(),
     batchExportMarkdown: vi.fn(),
+    listSkills: vi.fn(async () => []),
   },
   errorMessage: (e: unknown) => String(e),
 }));
@@ -190,21 +191,28 @@ test('a failed pin leaves the original conversation in place', async () => {
   expect(sidebar().getByText('Active fixture')).toBeTruthy();
 });
 
-test('archive checkbox loads and hides archived conversations', async () => {
+/** "Show archived" lives in the sessions page's More menu. */
+const toggleArchived = async (user: ReturnType<typeof userEvent.setup>) => {
+  await user.click(screen.getByRole('button', { name: 'More' }));
+  await user.click(screen.getByRole('menuitemcheckbox', { name: /archived/i }));
+};
+
+test('archive option loads and hides archived conversations', async () => {
   render(<I18nProvider><App /></I18nProvider>);
   await sidebar().findByText('Active fixture');
   expect(sidebar().queryByText('Archived fixture')).toBeNull();
   const user = userEvent.setup();
-  const checkbox = screen.getByRole('checkbox', { name: /archived/i });
-  await user.click(checkbox);
+  await toggleArchived(user);
   await sidebar().findByText('Archived fixture');
   expect(api.listConversations).toHaveBeenCalledWith(true);
-  await user.click(checkbox);
+  await user.click(screen.getByRole('button', { name: 'More' }));
+  expect(screen.getByRole('menuitemcheckbox', { name: /archived/i }).getAttribute('aria-checked')).toBe('true');
+  await user.click(screen.getByRole('menuitemcheckbox', { name: /archived/i }));
   await waitFor(() => expect(sidebar().queryByText('Archived fixture')).toBeNull());
   expect(sidebar().getByText('Active fixture')).toBeTruthy();
 });
 
-test('archive checkbox also controls search results', async () => {
+test('archive option also controls search results', async () => {
   render(<I18nProvider><App /></I18nProvider>);
   await sidebar().findByText('Active fixture');
   const user = userEvent.setup();
@@ -213,9 +221,27 @@ test('archive checkbox also controls search results', async () => {
   // Typing is debounced into a single query.
   expect(api.searchConversations).toHaveBeenCalledTimes(1);
   expect(sidebar().queryByText('Archived fixture')).toBeNull();
-  await user.click(screen.getByRole('checkbox', { name: /archived/i }));
+  await toggleArchived(user);
   await sidebar().findByText('Archived fixture');
   expect(api.searchConversations).toHaveBeenLastCalledWith('Archived fixture', undefined, true);
+});
+
+test('the navigation rail switches pages, and conversation shortcuts only act on the sessions page', async () => {
+  render(<I18nProvider><App /></I18nProvider>);
+  await screen.findByRole('heading', { name: 'Active fixture' });
+  const user = userEvent.setup();
+  const nav = within(screen.getByRole('navigation'));
+  await user.click(nav.getByRole('button', { name: 'Skills' }));
+  expect(screen.getByRole('heading', { name: 'Skills', level: 1 })).toBeTruthy();
+  expect(screen.queryByRole('complementary')).toBeNull();
+  expect(localStorage.getItem('cv_active_page')).toBe('skills');
+  // Delete must not open a dialog for a conversation that is not on screen.
+  await user.keyboard('{Delete}');
+  expect(screen.queryByText('Confirm Delete')).toBeNull();
+
+  await user.keyboard('{Control>}k{/Control}');
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('searchbox')));
+  expect(nav.getByRole('button', { name: 'Sessions' }).getAttribute('aria-current')).toBe('page');
 });
 
 test('renaming updates the open conversation header', async () => {
@@ -257,11 +283,11 @@ test('batch export starts in the project folder and remembers the last successfu
   await sidebar().findByText('Active fixture');
   const user = userEvent.setup();
   await user.click(within(sidebarRow('Active fixture')).getByRole('checkbox'));
-  await user.click(screen.getByRole('button', { name: 'Batch Save MD' }));
+  await user.click(screen.getByRole('button', { name: 'Export MD' }));
   await waitFor(() => expect(api.batchExportMarkdown).toHaveBeenCalledWith(['active'], 'E:\\导出目录\\会话'));
   expect(api.pickFolderPath).toHaveBeenNthCalledWith(1, active.project_path);
   await waitFor(() => expect(localStorage.getItem('cv_batch_export_directory')).toBe('E:\\导出目录\\会话'));
-  await user.click(screen.getByRole('button', { name: 'Batch Save MD' }));
+  await user.click(screen.getByRole('button', { name: 'Export MD' }));
   await waitFor(() => expect(api.pickFolderPath).toHaveBeenNthCalledWith(2, 'E:\\导出目录\\会话'));
   expect(api.batchExportMarkdown).toHaveBeenCalledTimes(1);
 });
@@ -274,7 +300,7 @@ test('a failed batch export preserves the previous successful directory', async 
   await sidebar().findByText('Active fixture');
   const user = userEvent.setup();
   await user.click(within(sidebarRow('Active fixture')).getByRole('checkbox'));
-  await user.click(screen.getByRole('button', { name: 'Batch Save MD' }));
+  await user.click(screen.getByRole('button', { name: 'Export MD' }));
   await screen.findByText(/Access denied/);
   expect(localStorage.getItem('cv_batch_export_directory')).toBe('E:\\previous');
 });
@@ -293,7 +319,7 @@ test('codex publish asks for confirmation with the real counts', async () => {
   await sidebar().findByText('Active fixture');
   const user = userEvent.setup();
   await user.click(within(sidebarRow('Active fixture')).getByRole('checkbox'));
-  await user.click(screen.getByRole('button', { name: 'Publish' }));
+  await user.click(screen.getByRole('button', { name: /^Publish to Codex/ }));
   const dialog = (await screen.findByText('Publish to Codex Client')).closest('div[class*="rounded-3xl"]') as HTMLElement;
   expect(within(dialog).getByText('4')).toBeTruthy();
   expect(api.publishToCodex).not.toHaveBeenCalled();

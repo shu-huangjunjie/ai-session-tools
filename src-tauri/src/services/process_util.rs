@@ -49,6 +49,16 @@ pub fn stop_processes(image_names: &[&str], timeout_s: f64, label: &str) -> Resu
     }
 }
 
+/// Force-closes a process and its children.
+pub fn kill_tree(pid: u32) -> Result<(), String> {
+    Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// Polls `condition` every 250 ms until it holds or the timeout expires.
 pub fn wait_until(timeout_s: f64, mut condition: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs_f64(timeout_s);
