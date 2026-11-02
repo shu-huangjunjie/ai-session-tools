@@ -4,9 +4,44 @@ Windows 本地 AI 工具管理器，支持 **Codex、Claude 和 Antigravity** �
 
 桌面程序仍显示原名称 **Context Vault**，可执行文件为 `Context-Vault.exe`。
 
-## 直接下载使用（Windows x64）
+## Windows 安装版（x64 / ARM64）
 
-从 [GitHub Releases](https://github.com/shu-huangjunjie/ai-session-tools/releases/latest) 下载 `AI-Session-Tools-0.1.5-Windows-x64.zip`，解压到可写目录后双击 `Context-Vault.exe`。整个文件夹可以一起移动，`data/` 保存本地数据，`backups/` 保存备份。
+`0.1.6` 提供两套 NSIS 安装程序：
+
+- [Windows x64 安装包](https://github.com/shu-huangjunjie/ai-session-tools/releases/download/v0.1.6/AI-Session-Tools-0.1.6-Windows-x64-setup.exe)：Intel / AMD 的 Windows 电脑。
+- [Windows ARM64 安装包](https://github.com/shu-huangjunjie/ai-session-tools/releases/download/v0.1.6/AI-Session-Tools-0.1.6-Windows-arm64-setup.exe)：Windows on ARM 电脑，应用本体为原生 ARM64。
+
+完整下载与校验文件见 [v0.1.6 发布页](https://github.com/shu-huangjunjie/ai-session-tools/releases/tag/v0.1.6)。安装包尚未进行代码签名；两套包均已完成解包与架构校验，ARM64 实机启动检查尚未完成。
+
+安装向导提供简体中文和英文，默认安装到当前用户目录，无需管理员权限，并创建开始菜单入口、提供卸载程序。缺少 WebView2 时会联网下载安装。安装版沿用 `%LOCALAPPDATA%\ContextRestoration\data` 下的会话库与同级 `backups`，安装包不包含个人数据。便携版原目录中的 `data` 和 `backups` 仍留在原位置，安装包不会自动迁移便携数据。
+
+在已安装 Node.js、Rust stable、Visual Studio C++ x64 / ARM64 Build Tools 和 Windows SDK 的 Windows 电脑上执行：
+
+```powershell
+.\scripts\build_installers.ps1
+# 也可只构建一个架构：
+.\scripts\build_installers.ps1 -Architecture x64
+.\scripts\build_installers.ps1 -Architecture arm64
+```
+
+安装包和 SHA-256 校验文件输出到 `releases/installers/0.1.6/`。构建脚本会校验应用 PE 架构及版本号，避免把 x64 程序误标为 ARM64。ARM64 包可在 x64 开发机上交叉编译，运行验证需 Windows ARM64 电脑。
+
+构建后可用完整 7-Zip 命令行程序验证两套安装包。此检查实际解包，校验应用本体架构、打包前后内容与 SHA-256，并确认没有打入会话库、账号或备份文件：
+
+```powershell
+node .\scripts\verify_installers.mjs "C:\Program Files\7-Zip\7z.exe"
+```
+
+只有 x64 Build Tools、但 Windows SDK 已包含 ARM64 库时，可以从本机 Visual Studio 官方组件清单下载独立 ARM64 工具到项目构建目录，无需修改系统安装：
+
+```powershell
+.\scripts\setup_arm64_tools.ps1
+.\scripts\build_installers.ps1 -Arm64ToolchainRoot .\releases\build-tools\msvc-arm64\toolchain
+```
+
+## 旧版便携程序（0.1.5，Windows x64）
+
+从 [v0.1.5 发布页](https://github.com/shu-huangjunjie/ai-session-tools/releases/tag/v0.1.5) 下载 `AI-Session-Tools-0.1.5-Windows-x64.zip`，解压到可写目录后双击 `Context-Vault.exe`。整个文件夹可以一起移动，`data/` 保存本地数据，`backups/` 保存备份。新版安装程序请使用上方的 v0.1.6 下载入口。
 
 需要 Windows 10/11 和 Microsoft Edge WebView2 运行时。更新旧版时，先退出程序，只替换 `Context-Vault.exe`，保留自己的 `data/` 和 `backups/` 文件夹。
 
@@ -34,6 +69,7 @@ Windows 本地 AI 工具管理器，支持 **Codex、Claude 和 Antigravity** �
 - [x] **输入防抖全文检索 (FTS5)**：使用 SQLite FTS5 trigram 索引按子串检索消息正文（可命中中文句子中间的词），一到两个字的关键词自动改用子串扫描；多个关键词需同时出现在标题或某条消息中；
 - [x] **三大引擎原生支持**：
   - **Codex 引擎**：扫描 `.codex` 下的 rollout 日志与 SQLite 索引；rollout 文件已不存在的会话从 `thread_history_N.sqlite` 恢复；发布前在应用内确认将显示与隐藏的会话数量，并自动备份 Codex 数据库；
+    - 兼容桌面会话的 `has_user_event=0` 情况，读取实际会话名称；启动时自动修复旧版导入的默认标题，保留在本工具内手动修改过的名称；
   - **Antigravity 引擎**：扫描并收录 Antigravity 历史会话，支持会话增量同步与更新回客户端；
   - **Claude 引擎**：扫描 `~/.claude/projects/` 各工程的 JSONL 会话流与 `custom-title.json`，智能合并深度思考链（Thinking）与工具调用卡片；
 - [x] **项目工程树视图**：
@@ -44,6 +80,7 @@ Windows 本地 AI 工具管理器，支持 **Codex、Claude 和 Antigravity** �
 - [x] **会话清理**：
   - 会话支持置顶与取消置顶，可通过行内图钉或右键菜单操作；置顶会话集中显示在当前来源列表顶部，重启和重新扫描后保留；
   - 工作文件夹也支持独立置顶，可通过文件夹标题旁的图钉或右键菜单操作；“置顶文件夹”排在普通项目之前，按来源保存，重启和重新扫描后保留；
+  - 按住左侧项目文件夹名称或拖动图标，上下拖动即可在当前分组内排序，蓝线表示放置位置；也可聚焦文件夹后按 `Alt + ↑/↓` 调整顺序。顺序按客户端与分组保存在本机，搜索、重新扫描和重启后保留；
   - 会话页顶部的“清空数据库”直接显示全部来源的会话、消息和删除记录数量，确认后自动备份再清空，包含归档会话；
   - 清空后保留空列表，可自行重新扫描导入；客户端的原始会话保留；
   - 侧栏保留批量删除，支持右键“重命名”与“删除”，以及 `F2` 与 `Delete` 快捷键；

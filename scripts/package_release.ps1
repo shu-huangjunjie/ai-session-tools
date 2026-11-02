@@ -71,7 +71,8 @@ $sourceFolders = @('assets', 'public', 'src', 'scripts', 'src-tauri/src', 'src-t
 $sourceFiles = @('.gitignore', '.gitattributes', 'README.md', 'CHANGELOG.md', '启动应用.bat', 'index.html',
     'package.json', 'package-lock.json', 'postcss.config.js', 'tailwind.config.js',
     'tsconfig.json', 'tsconfig.node.json', 'vite.config.ts', 'vitest.config.ts',
-    'src-tauri/build.rs', 'src-tauri/Cargo.toml', 'src-tauri/Cargo.lock', 'src-tauri/tauri.conf.json')
+    'src-tauri/build.rs', 'src-tauri/Cargo.toml', 'src-tauri/Cargo.lock', 'src-tauri/tauri.conf.json',
+    'src-tauri/tauri.installer.conf.json')
 foreach ($folder in $sourceFolders) {
     $folderPath = Join-Path $projectRoot $folder
     foreach ($file in (Get-ChildItem -LiteralPath $folderPath -File -Recurse -Force)) {

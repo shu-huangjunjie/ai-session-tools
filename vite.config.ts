@@ -19,7 +19,7 @@ export default defineConfig({
     strictPort: true,
     host: '127.0.0.1',
     watch: {
-      ignored: ['**/src-tauri/**'],
+      ignored: ['**/src-tauri/**', '**/releases/**'],
     },
   },
   build: {

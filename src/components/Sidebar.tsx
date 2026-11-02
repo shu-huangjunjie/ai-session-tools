@@ -14,12 +14,14 @@ import {
   X,
   Pin,
   PinOff,
+  GripVertical,
 } from 'lucide-react';
 import { CodexVisibility, ConversationSummary, FolderPin } from '../types';
 import { folderPinKey } from '../utils/folderPins';
 import { extractProjectName } from '../utils/formatters';
 import { ItemGroup, groupByFolder, splitByCodexScope } from '../utils/codexScope';
 import { useI18n } from '../i18n';
+import { FOLDER_ORDER_STORAGE_KEY, moveFolder, readFolderOrders, sortFolders } from '../utils/folderOrder';
 
 const CHATS_KEY = 'chats';
 const PINNED_KEY = 'pinned';
@@ -34,7 +36,13 @@ type TreeRow =
       /** Expands and collapses the groups after it. */
       collapsible?: boolean;
     }
-  | { kind: 'group'; group: ItemGroup<ConversationSummary> };
+  | { kind: 'group'; group: ItemGroup<ConversationSummary>; scope?: string };
+
+type FolderDrop = { key: string; edge: 'before' | 'after' };
+type FolderDrag = {
+  key: string; scope: string; source: SidebarProps['activeSource'];
+  pointerId: number; x: number; y: number; moved: boolean;
+};
 
 interface SidebarProps {
   width: number;
@@ -86,6 +94,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
 }) => {
   const { t, interpolate } = useI18n();
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(new Set());
+  const [folderOrders, setFolderOrders] = useState(readFolderOrders);
+  const dragRef = useRef<FolderDrag | null>(null);
+  const suppressFolderClick = useRef(false);
+  const [draggingFolder, setDraggingFolder] = useState<string | null>(null);
+  const [folderDrop, setFolderDrop] = useState<FolderDrop | null>(null);
+  const treeRef = useRef<HTMLDivElement>(null);
   const [contextMenu, setContextMenu] = useState<(
     { kind: 'conversation'; x: number; y: number; conv: ConversationSummary } |
     { kind: 'folder'; x: number; y: number; path: string }
@@ -153,6 +167,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   const treeRows = useMemo<TreeRow[]>(() => {
     const rows: TreeRow[] = [];
+    const ordered = (groups: ItemGroup<ConversationSummary>[], scope: string): TreeRow[] =>
+      sortFolders(groups, folderOrders[`${activeSource}:${scope}`])
+        .map((group) => ({ kind: 'group', group, scope }));
     if (pinnedConversations.length > 0) {
       rows.push({ kind: 'group', group: {
         key: PINNED_KEY, name: t.sidebar.pinned, items: pinnedConversations,
@@ -161,12 +178,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
     if (pinnedFolderGroups.length > 0) {
       rows.push({ kind: 'section', key: 'section:pinned-folders', label: t.sidebar.pinnedFolders,
         tooltip: t.sidebar.pinnedFolders, count: pinnedFolderGroups.length });
-      rows.push(...pinnedFolderGroups.map((group): TreeRow => ({ kind: 'group', group })));
+      rows.push(...ordered(pinnedFolderGroups, 'pinned-folders'));
     }
     const ordinary = (group: ItemGroup<ConversationSummary>) =>
       !group.path || !pinnedFolderTimes.has(folderPinKey(group.path));
     if (!codexSections) {
-      return [...rows, ...folderGroups.filter(ordinary).map((group): TreeRow => ({ kind: 'group', group }))];
+      return [...rows, ...ordered(folderGroups.filter(ordinary), 'folders')];
     }
     const visible = codexSections.projects.filter(ordinary);
     if (codexSections.chats.length > 0) {
@@ -180,7 +197,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         tooltip: t.sidebar.codexVisibleTooltip,
         count: visible.reduce((n, g) => n + g.items.length, 0),
       });
-      rows.push(...visible.map((group): TreeRow => ({ kind: 'group', group })));
+      rows.push(...ordered(visible, 'visible'));
     }
     const hidden = codexSections.hidden.filter(ordinary);
     const hiddenCount = hidden.reduce((count, group) => count + group.items.length, 0);
@@ -194,11 +211,84 @@ export const Sidebar: React.FC<SidebarProps> = ({
         collapsible: true,
       });
       if (showHidden) {
-        rows.push(...hidden.map((group): TreeRow => ({ kind: 'group', group })));
+        rows.push(...ordered(hidden, 'hidden'));
       }
     }
     return rows;
-  }, [pinnedConversations, pinnedFolderGroups, pinnedFolderTimes, codexSections, folderGroups, showHidden, t.sidebar]);
+  }, [pinnedConversations, pinnedFolderGroups, pinnedFolderTimes, codexSections, folderGroups, showHidden, t.sidebar, folderOrders, activeSource]);
+
+  const cancelFolderDrag = () => {
+    dragRef.current = null;
+    setDraggingFolder(null);
+    setFolderDrop(null);
+  };
+
+  // Pointer dragging works in the Windows WebView without disabling native file drops.
+  useEffect(() => {
+    const cancelOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') cancelFolderDrag();
+    };
+    window.addEventListener('keydown', cancelOnEscape);
+    window.addEventListener('blur', cancelFolderDrag);
+    return () => {
+      window.removeEventListener('keydown', cancelOnEscape);
+      window.removeEventListener('blur', cancelFolderDrag);
+    };
+  }, []);
+  useEffect(cancelFolderDrag, [activeSource, searchQuery]);
+
+  const findFolderDrop = (x: number, y: number, drag: FolderDrag): FolderDrop | null => {
+    const element = document.elementFromPoint(x, y)?.closest<HTMLElement>('[data-folder-sort-key]');
+    if (!element || !treeRef.current?.contains(element) ||
+        element.dataset.folderSortScope !== drag.scope ||
+        element.dataset.folderSortKey === drag.key) return null;
+    const header = element.querySelector<HTMLElement>('[data-folder-header]');
+    if (!header) return null;
+    const rect = header.getBoundingClientRect();
+    return { key: element.dataset.folderSortKey!, edge: y < rect.top + rect.height / 2 ? 'before' : 'after' };
+  };
+
+  const saveFolderMove = (scope: string, key: string, drop: FolderDrop) => {
+    const visible = treeRows.flatMap((row) =>
+      row.kind === 'group' && row.scope === scope && row.group.path ? [row.group.key] : []);
+    if (!visible.includes(key) || !visible.includes(drop.key)) return;
+    const storageScope = `${activeSource}:${scope}`;
+    const next = { ...folderOrders, [storageScope]: moveFolder(
+      folderOrders[storageScope] ?? [], visible, key, drop.key, drop.edge
+    ) };
+    setFolderOrders(next);
+    try {
+      localStorage.setItem(FOLDER_ORDER_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // Keep sorting usable for this session when browser storage is unavailable.
+    }
+  };
+
+  const handleFolderPointerMove = (event: React.PointerEvent) => {
+    const drag = dragRef.current;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    if (!drag.moved && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < 5) return;
+    drag.moved = true;
+    suppressFolderClick.current = true;
+    event.preventDefault();
+    setDraggingFolder(drag.key);
+    const tree = treeRef.current;
+    if (tree) {
+      const rect = tree.getBoundingClientRect();
+      if (event.clientY < rect.top + 28) tree.scrollTop -= 16;
+      else if (event.clientY > rect.bottom - 28) tree.scrollTop += 16;
+    }
+    setFolderDrop(findFolderDrop(event.clientX, event.clientY, drag));
+  };
+
+  const handleFolderPointerUp = (event: React.PointerEvent) => {
+    const drag = dragRef.current;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    const drop = drag.moved && drag.source === activeSource
+      ? findFolderDrop(event.clientX, event.clientY, drag) : null;
+    if (drop) saveFolderMove(drag.scope, drag.key, drop);
+    cancelFolderDrag();
+  };
 
   const toggleCollapse = (projectKey: string) => {
     setCollapsedProjects((prev) => {
@@ -296,7 +386,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </div>
 
       {/* Project tree */}
-      <div className="flex-1 overflow-y-auto px-2 pb-2">
+      <div ref={treeRef} className="flex-1 overflow-y-auto px-2 pb-2">
         {treeRows.length === 0 ? (
           <div className="text-center py-16 px-4 text-[#86868b] text-xs leading-relaxed">
             {emptyText}
@@ -346,9 +436,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
             const someChecked = convIds.some((id) => publishSelection.has(id)) && !allChecked;
 
             return (
-              <div key={group.key} className="pt-1">
+              <div
+                key={group.key}
+                data-folder-sort-key={folder ? group.key : undefined}
+                data-folder-sort-scope={folder ? row.scope : undefined}
+                className={`relative pt-1 ${draggingFolder === group.key ? 'opacity-40' : ''}`}
+              >
+                {folderDrop?.key === group.key && (
+                  <div data-folder-drop-indicator className={`absolute left-2 right-1 h-0.5 rounded bg-[#0071e3] dark:bg-[#2997ff] pointer-events-none z-10 ${
+                    folderDrop.edge === 'before' ? 'top-0' : 'bottom-0'
+                  }`} />
+                )}
                 {/* Project Header Row */}
                 <div
+                  data-folder-header
                   onContextMenu={(e) => {
                     if (!folder) return;
                     e.preventDefault();
@@ -367,9 +468,43 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   />
 
                   <button
-                    onClick={() => toggleCollapse(group.key)}
-                    className="flex items-center gap-1.5 text-left min-w-0 flex-1 text-[12.5px] font-semibold text-[#1d1d1f] dark:text-[#f5f5f7]"
+                    type="button"
+                    aria-expanded={!isCollapsed}
+                    title={folder ? t.sidebar.reorderFolder : undefined}
+                    style={folder ? { touchAction: 'none' } : undefined}
+                    onPointerDown={(event) => {
+                      suppressFolderClick.current = false;
+                      if (!folder || !row.scope || event.button !== 0 || event.isPrimary === false) return;
+                      closeContextMenu();
+                      dragRef.current = { key: group.key, scope: row.scope, source: activeSource,
+                        pointerId: event.pointerId, x: event.clientX, y: event.clientY, moved: false };
+                      event.currentTarget.setPointerCapture?.(event.pointerId);
+                    }}
+                    onPointerMove={handleFolderPointerMove}
+                    onPointerUp={handleFolderPointerUp}
+                    onPointerCancel={cancelFolderDrag}
+                    onLostPointerCapture={cancelFolderDrag}
+                    onDragStart={(event) => event.preventDefault()}
+                    onKeyDown={(event) => {
+                      if (!folder || !row.scope || !event.altKey || !['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+                      event.preventDefault();
+                      const siblings = treeRows.filter((item) => item.kind === 'group' && item.scope === row.scope && item.group.path);
+                      const index = siblings.findIndex((item) => item.kind === 'group' && item.group.key === group.key);
+                      const neighbor = siblings[index + (event.key === 'ArrowUp' ? -1 : 1)];
+                      if (neighbor?.kind === 'group') saveFolderMove(row.scope, group.key, {
+                        key: neighbor.group.key, edge: event.key === 'ArrowUp' ? 'before' : 'after',
+                      });
+                    }}
+                    onClick={(event) => {
+                      if (suppressFolderClick.current && event.detail !== 0) {
+                        suppressFolderClick.current = false;
+                        return;
+                      }
+                      toggleCollapse(group.key);
+                    }}
+                    className={`flex items-center gap-1.5 text-left min-w-0 flex-1 text-[12.5px] font-semibold text-[#1d1d1f] dark:text-[#f5f5f7] ${folder ? 'cursor-grab active:cursor-grabbing' : ''}`}
                   >
+                    {folder && <GripVertical size={11} aria-hidden="true" className="text-[#86868b] flex-shrink-0 opacity-40 group-hover:opacity-100" />}
                     {isCollapsed ? (
                       <ChevronRight size={13} className="text-[#86868b] flex-shrink-0" />
                     ) : (

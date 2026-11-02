@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.6 (2026-11-02)
+
+- Add Windows x64 and native ARM64 NSIS installers, with Chinese/English setup, per-user installation, Start menu shortcuts and automatic WebView2 installation when needed. Installed builds use the existing system vault data directory.
+- Drag project folder names or their handles to reorder folders within each section. Remember the order by client and section, including after searches and restarts; support Alt + Up/Down and cancellation with Escape.
+- Read Codex desktop session names when the legacy user-event flag is zero. Repair imported placeholder titles on startup while preserving user renames; fall back to the session index and actual user requests in newer rollout files.
+
 ## 0.1.5 (2026-10-26)
 
 - Redesign the window around a left navigation rail with a full page each for Sessions, Skills, MCP and Accounts; language and theme sit at the bottom of the rail. Clearing the local database moved to the Sessions page header. New app icon (a chat bubble with a restore arrow).

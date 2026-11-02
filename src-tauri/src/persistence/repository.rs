@@ -713,7 +713,8 @@ impl<'a> Repository<'a> {
                 });
 
                 if let Ok((current_title, prev_source_title, mut user_edited)) = cdata {
-                    if prev_source_title.is_none() && current_title != *source_title {
+                    if prev_source_title.is_none() && current_title != *source_title
+                        && !(source_type == "codex_rollout" && current_title == "Codex 会话") {
                         user_edited = true;
                     }
                     let visible_title = if user_edited {
@@ -851,7 +852,8 @@ impl<'a> Repository<'a> {
                     ))
                 })
             {
-                if prev_src_title.is_none() && cur_title != title {
+                if prev_src_title.is_none() && cur_title != title
+                    && !(source_type == "codex_rollout" && cur_title == "Codex 会话") {
                     user_edited = true;
                 }
                 let visible_title = if user_edited {

@@ -158,6 +158,7 @@ impl<'a> CodexRecoveryService<'a> {
     pub fn scan(&self) -> CodexRecoveryReport {
         let repo = Repository::new(self.db);
         let sidebar = self.read_sidebar_state();
+        let session_titles = self.read_session_titles();
         let archived_ids = self.archived_thread_ids();
         let rollout_by_id = self.rollout_index();
         let mut merged: HashMap<String, MergedCandidate> = HashMap::new();
@@ -208,7 +209,8 @@ impl<'a> CodexRecoveryService<'a> {
                         if entry.model.is_none() && row.model.is_some() {
                             entry.model = row.model.clone();
                         }
-                        if entry.title == "Codex 会话" && row_title != "Codex 会话" {
+                        if row_title != "Codex 会话" && (entry.title == "Codex 会话"
+                            || (row.title_is_name && *path == self.codex_home.join("state_5.sqlite"))) {
                             entry.title = row_title;
                         }
                         if entry.project_path.is_none() && project_path.is_some() {
@@ -278,7 +280,18 @@ impl<'a> CodexRecoveryService<'a> {
         let mut missing = 0;
         let mut excluded = 0;
 
-        for item in merged.into_values() {
+        for mut item in merged.into_values() {
+            if item.title == "Codex 会话" || !item.sources.contains("当前 Codex") {
+                if let Some(title) = session_titles.get(&item.thread_id) {
+                    item.title = title.clone();
+                }
+            }
+            if item.title == "Codex 会话" {
+                if let Some(meta) = item.rollout_path.as_deref()
+                    .and_then(|path| read_rollout_metadata(path, &item.thread_id)) {
+                    item.title = meta.title;
+                }
+            }
             if excluded_ids.contains(&item.thread_id) {
                 excluded += 1;
                 continue;
@@ -350,6 +363,59 @@ impl<'a> CodexRecoveryService<'a> {
             }
         }
         repo.sync_import_titles(Self::SOURCE_TYPE, &titles).unwrap_or(0)
+    }
+
+    /// Repair titles on startup without reimporting messages or scanning every rollout.
+    /// Codex files are opened read-only; only the vault's imported titles are updated.
+    pub fn refresh_existing_titles(&self) -> Result<usize, String> {
+        let repo = Repository::new(self.db);
+        let imported = repo.imported_source_ids(Self::SOURCE_TYPE).map_err(|e| e.to_string())?;
+        if imported.is_empty() {
+            return Ok(0);
+        }
+        let mut titles = HashMap::new();
+        let state_path = self.codex_home.join("state_5.sqlite");
+        if let Ok(rows) = Self::read_thread_index(&state_path, false) {
+            for row in rows {
+                let title = clean_title(&row.title, &row.id);
+                if imported.contains(&row.id) && title != "Codex 会话" {
+                    titles.insert(row.id, title);
+                }
+            }
+        }
+        for (id, title) in self.read_session_titles() {
+            if imported.contains(&id) {
+                titles.entry(id).or_insert(title);
+            }
+        }
+        let catalog_path = self.codex_home.join("sqlite").join("codex-dev.db");
+        if let Ok(rows) = Self::read_catalog_index(&catalog_path) {
+            for row in rows {
+                let title = clean_title(&row.title, &row.id);
+                if imported.contains(&row.id) && title != "Codex 会话" {
+                    titles.entry(row.id).or_insert(title);
+                }
+            }
+        }
+        repo.sync_import_titles(Self::SOURCE_TYPE, &titles).map_err(|e| e.to_string())
+    }
+
+    fn read_session_titles(&self) -> HashMap<String, String> {
+        let mut titles = HashMap::new();
+        let Ok(file) = File::open(self.codex_home.join("session_index.jsonl")) else {
+            return titles;
+        };
+        // This index is append-only: later records contain the latest rename.
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+            let Some(id) = record.get("id").and_then(|v| v.as_str()) else { continue };
+            let Some(name) = record.get("thread_name").and_then(|v| v.as_str()) else { continue };
+            let title = clean_title(name, id);
+            if !id.is_empty() && title != "Codex 会话" {
+                titles.insert(id.to_string(), title);
+            }
+        }
+        titles
     }
 
     pub fn recover(
@@ -831,7 +897,15 @@ impl<'a> CodexRecoveryService<'a> {
 
         let mut conditions = Vec::new();
         if cols.contains("has_user_event") {
-            conditions.push("has_user_event = 1".to_string());
+            // Desktop sessions may contain response_item messages while this legacy
+            // flag remains 0. Their names and first prompts still identify real chats.
+            let mut evidence = vec!["has_user_event = 1".to_string()];
+            for column in ["name", "title", "first_user_message"] {
+                if cols.contains(column) {
+                    evidence.push(format!("TRIM(COALESCE({}, '')) <> ''", column));
+                }
+            }
+            conditions.push(format!("({})", evidence.join(" OR ")));
         }
         if !include_subagents {
             if cols.contains("thread_source") {
@@ -888,13 +962,15 @@ impl<'a> CodexRecoveryService<'a> {
                 Value::Text(s) => s == "1" || s.eq_ignore_ascii_case("true"),
                 _ => false,
             };
+            let display_name = first_non_empty([text(7)?]);
 
             Ok(ThreadIndexRow {
                 id,
                 rollout_path: text(1)?,
                 updated_at,
                 model_provider: text(4)?,
-                title: first_non_empty([text(7)?, text(5)?, text(6)?])
+                title_is_name: display_name.is_some(),
+                title: first_non_empty([display_name, text(5)?, text(6)?])
                     .unwrap_or_else(|| "Codex 会话".to_string()),
                 archived,
                 model: text(9)?,
@@ -959,6 +1035,7 @@ impl<'a> CodexRecoveryService<'a> {
                 updated_at: timestamp_from_value(&row.get::<_, Value>(1)?).unwrap_or_default(),
                 model_provider: text(2)?,
                 title: first_non_empty([text(3)?]).unwrap_or_else(|| "Codex 会话".to_string()),
+                title_is_name: true,
                 archived: false,
                 model: None,
                 cwd: text(4)?,
@@ -1008,7 +1085,8 @@ fn has_history_messages(conn: &Connection, thread_id: &str) -> bool {
 fn user_request_text(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty()
-        || ["<in-app-browser-context", "<environment_context", "<user_instructions"]
+        || ["<in-app-browser-context", "<environment_context", "<user_instructions",
+            "<external_codex_apps_open_page", "# AGENTS.md instructions"]
             .iter()
             .any(|tag| trimmed.starts_with(tag))
     {
@@ -1030,6 +1108,7 @@ struct ThreadIndexRow {
     updated_at: String,
     model_provider: Option<String>,
     title: String,
+    title_is_name: bool,
     archived: bool,
     model: Option<String>,
     cwd: Option<String>,
@@ -1146,13 +1225,25 @@ fn read_rollout_metadata(path: &Path, thread_id: &str) -> Option<RolloutMeta> {
             if let Some(m) = payload.get("model").and_then(|s| s.as_str()) {
                 model = Some(m.to_string());
             }
-        } else if item_type == "event_msg" && payload.get("type").and_then(|t| t.as_str()) == Some("user_message") {
-            if title.is_none() {
-                if let Some(msg) = payload.get("message").and_then(|m| m.as_str()) {
-                    let cleaned = clean_title(msg, thread_id);
-                    if !cleaned.is_empty() {
-                        title = Some(cleaned);
-                    }
+        } else if title.is_none() {
+            let request = if item_type == "event_msg"
+                && payload.get("type").and_then(|t| t.as_str()) == Some("user_message") {
+                payload.get("message").and_then(|m| m.as_str()).and_then(user_request_text)
+            } else if item_type == "response_item"
+                && payload.get("type").and_then(|t| t.as_str()) == Some("message")
+                && payload.get("role").and_then(|r| r.as_str()) == Some("user") {
+                // Context and the actual request may be separate content blocks.
+                payload.get("content").and_then(|c| c.as_array()).and_then(|blocks| {
+                    blocks.iter().filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+                        .find_map(user_request_text)
+                })
+            } else {
+                None
+            };
+            if let Some(request) = request {
+                let cleaned = clean_title(&request, thread_id);
+                if cleaned != "Codex 会话" {
+                    title = Some(cleaned);
                 }
             }
         }

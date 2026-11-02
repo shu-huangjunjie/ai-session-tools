@@ -530,6 +530,98 @@ fn codex_home(root: &std::path::Path) -> PathBuf {
 }
 
 #[test]
+fn codex_desktop_names_are_read_even_when_legacy_user_event_flag_is_zero() {
+    use context_vault_lib::services::CodexRecoveryService;
+    let (root, db) = fixture("codex-desktop-names");
+    let home = codex_home(&root);
+    let state = Connection::open(home.join("state_5.sqlite")).unwrap();
+    state.execute_batch(
+        "UPDATE threads SET has_user_event = 0, name = 'Actual desktop name';"
+    ).unwrap();
+    let report = CodexRecoveryService::new(&db, Some(&home)).scan();
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(report.candidates.len(), 2); // Subagents still stay excluded.
+    for candidate in report.candidates {
+        assert_eq!(candidate.title, "Actual desktop name");
+        assert!(candidate.source_indexes.iter().any(|s| s == "当前 Codex"));
+    }
+}
+
+#[test]
+fn codex_startup_title_refresh_repairs_placeholders_and_preserves_user_renames() {
+    use context_vault_lib::services::CodexRecoveryService;
+    let (root, db) = fixture("codex-refresh-names");
+    let home = codex_home(&root);
+    let state = Connection::open(home.join("state_5.sqlite")).unwrap();
+    state.execute_batch("UPDATE threads SET has_user_event = 0, name = 'Desktop name';").unwrap();
+    let repo = Repository::new(&db);
+    let first = "11111111-1111-1111-1111-111111111111";
+    let second = "22222222-2222-2222-2222-222222222222";
+    let create = |id: &str| repo.sync_import_conversation(
+        "Codex 会话", CodexRecoveryService::SOURCE_TYPE, id,
+        &[message("m1", None, "Keep original message")], None, Some("C:/demo"), "codex_main",
+    ).unwrap().0;
+    let repaired_id = create(first);
+    let renamed_id = create(second);
+    let explicit_placeholder_id = create("explicit-placeholder");
+    let legacy_custom_id = create("legacy-custom");
+    repo.rename_conversation(&renamed_id, "My custom name").unwrap();
+    repo.rename_conversation(&explicit_placeholder_id, "Codex 会话").unwrap();
+    repo.set_pinned(&repaired_id, true).unwrap();
+    let pin = repo.get_conversation(&repaired_id).unwrap().unwrap().pinned_at;
+    // Older imports did not record the original source title.
+    db.lock_conn().execute("UPDATE conversations SET source_title = NULL WHERE id = ?1", [&repaired_id]).unwrap();
+    db.lock_conn().execute("UPDATE conversations SET title = 'Legacy custom', source_title = NULL WHERE id = ?1", [&legacy_custom_id]).unwrap();
+    fs::write(home.join("session_index.jsonl"), concat!(
+        "{\"id\":\"explicit-placeholder\",\"thread_name\":\"New source name\"}\n",
+        "{\"id\":\"legacy-custom\",\"thread_name\":\"New legacy source name\"}\n"
+    )).unwrap();
+    let service = CodexRecoveryService::new(&db, Some(&home));
+    assert_eq!(service.refresh_existing_titles().unwrap(), 1);
+    let repaired = repo.get_conversation(&repaired_id).unwrap().unwrap();
+    assert_eq!(repaired.title, "Desktop name");
+    assert!(!repaired.title_user_edited);
+    assert_eq!(repaired.pinned_at, pin);
+    let renamed = repo.get_conversation(&renamed_id).unwrap().unwrap();
+    assert_eq!(renamed.title, "My custom name");
+    assert_eq!(renamed.source_title.as_deref(), Some("Desktop name"));
+    assert_eq!(repo.get_conversation(&explicit_placeholder_id).unwrap().unwrap().title, "Codex 会话");
+    assert_eq!(repo.get_conversation(&legacy_custom_id).unwrap().unwrap().title, "Legacy custom");
+    assert_eq!(repo.load_active_path(&repaired_id).unwrap()[0].content, "Keep original message");
+    assert_eq!(service.refresh_existing_titles().unwrap(), 0); // Idempotent.
+}
+
+#[test]
+fn codex_rollout_names_fall_back_to_real_response_requests_and_session_index() {
+    use context_vault_lib::services::CodexRecoveryService;
+    let (root, db) = fixture("codex-response-title");
+    let home = root.join("codex");
+    fs::create_dir_all(home.join("sessions")).unwrap();
+    let id = "11111111-1111-1111-1111-111111111111";
+    let path = home.join(format!("sessions/rollout-2026-10-31T10-00-00-{id}.jsonl"));
+    let user = |text: &str| serde_json::json!({
+        "type": "response_item", "payload": {"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": text}]}
+    }).to_string();
+    let lines = [
+        serde_json::json!({"type": "session_meta", "payload": {"id": id, "cwd": "C:/demo", "source": "vscode"}}).to_string(),
+        user("<environment_context>test context</environment_context>"),
+        user("<external_codex_apps_open_page>{\"page_id\":null}</external_codex_apps_open_page>"),
+        user("# Files mentioned by the user:\n## screenshot.png: C:/screenshot.png\n## My request:\n显示正确的会话名称"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+    let service = CodexRecoveryService::new(&db, Some(&home));
+    assert_eq!(service.scan().candidates[0].title, "显示正确的会话名称");
+    fs::write(home.join("session_index.jsonl"), format!(
+        "{{\"id\":\"{id}\",\"thread_name\":\"First name\"}}\ninvalid line\n{{\"id\":\"{id}\",\"thread_name\":\"Latest name\"}}\n"
+    )).unwrap();
+    assert_eq!(service.scan().candidates[0].title, "Latest name");
+    // Even a rollout with no user text obtains its name from the desktop index.
+    fs::write(&path, lines[..1].join("\n")).unwrap();
+    assert_eq!(service.scan().candidates[0].title, "Latest name");
+}
+
+#[test]
 fn codex_scan_reads_integer_timestamps_from_state_index() {
     use context_vault_lib::services::CodexRecoveryService;
     let (root, db) = fixture("codex-scan");

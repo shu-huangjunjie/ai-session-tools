@@ -36,6 +36,10 @@ fn initialize() -> Result<AppState, String> {
     // Daily backup if needed
     let _ = database.backup_if_needed();
 
+    // Repair previously imported placeholders using Codex's current display names.
+    let _ = services::CodexRecoveryService::new(&database, Some(&paths.codex_home()))
+        .refresh_existing_titles();
+
     Ok(AppState { paths, database })
 }
 

@@ -10,6 +10,50 @@ use context_vault_lib::services::{
 use std::time::Instant;
 
 #[test]
+#[ignore = "Reads Codex display names on this computer; writes only a temporary vault"]
+fn local_codex_titles_match_desktop_names_and_repair_existing_placeholders() {
+    use context_vault_lib::persistence::ImportedMessagePayload;
+    let root = std::env::temp_dir().join(format!("cv-title-smoke-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let db = Database::new(&root.join("vault.db"), &root.join("backups")).unwrap();
+    let home = AppPaths::discover(Some(&root)).unwrap().codex_home();
+    let source = rusqlite::Connection::open_with_flags(
+        home.join("state_5.sqlite"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).unwrap();
+    let names: std::collections::HashMap<String, String> = source.prepare(
+        "SELECT id, name FROM threads WHERE TRIM(COALESCE(name, '')) <> '' AND COALESCE(thread_source, '') <> 'subagent'"
+    ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap().collect::<Result<_, _>>().unwrap();
+    let service = CodexRecoveryService::new(&db, Some(&home));
+    let report = service.scan();
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    let repo = Repository::new(&db);
+    let mut checked = 0;
+    for candidate in &report.candidates {
+        let Some(name) = names.get(&candidate.thread_id) else { continue };
+        let expected: String = name.trim().chars().take(80).collect();
+        assert_eq!(candidate.title, expected);
+        repo.sync_import_conversation(
+            "Codex 会话", CodexRecoveryService::SOURCE_TYPE, &candidate.thread_id,
+            &[ImportedMessagePayload { role: "user".into(), content: "Test placeholder".into(),
+                external_id: "test-message".into(), parent_external_id: None, created_at: None }],
+            None, None, "codex_main",
+        ).unwrap();
+        checked += 1;
+    }
+    assert!(checked > 0);
+    assert_eq!(service.refresh_existing_titles().unwrap(), checked);
+    for conversation in repo.list_conversations(false, None).unwrap() {
+        assert_ne!(conversation.title, "Codex 会话");
+    }
+    println!("Verified {checked} local desktop names and repaired {checked} placeholders in a temporary vault.");
+    drop(repo);
+    drop(service);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 #[ignore = "Reads the Codex, Claude and Antigravity histories installed on this computer"]
 fn scan_and_recover_local_histories() {
     let root = std::env::temp_dir().join(format!("cv-smoke-{}", uuid::Uuid::new_v4()));

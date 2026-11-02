@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AI Session Tools",
+  "bundle": {
+    "targets": ["nsis"],
+    "publisher": "shu-huangjunjie",
+    "homepage": "https://github.com/shu-huangjunjie/ai-session-tools",
+    "shortDescription": "AI 会话工具",
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": true,
+        "installerIcon": "icons/icon.ico",
+        "startMenuFolder": "AI Session Tools",
+        "compression": "lzma"
+      }
+    }
+  }
+}
