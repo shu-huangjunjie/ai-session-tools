@@ -72,6 +72,9 @@ pub async fn publish_to_codex(
     run_blocking(move || {
         let thread_ids = resolve_thread_ids(&db, &selected_thread_ids)?;
         let purge_ids = resolve_thread_ids(&db, &purge_thread_ids)?;
+        let title_overrides = Repository::new(&db)
+            .user_edited_titles_for_source(CodexRecoveryService::SOURCE_TYPE)
+            .unwrap_or_default();
         let publisher = CodexClientPublisher::new(None, &backups);
         // Validate before touching the running client.
         let preview = publisher.preview(&thread_ids)?;
@@ -88,7 +91,7 @@ pub async fn publish_to_codex(
             controller.stop(15.0)?;
         }
 
-        let result = publisher.publish(&thread_ids, &purge_ids);
+        let result = publisher.publish_with_titles(&thread_ids, &purge_ids, &title_overrides);
 
         if was_running || auto_restart_client {
             let _ = controller.start(15.0);

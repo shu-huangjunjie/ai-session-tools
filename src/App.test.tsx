@@ -6,7 +6,9 @@ import { I18nProvider } from './i18n';
 import { api } from './api/client';
 import { MessageBubble } from './components/MessageBubble';
 import { CodexRecoveryModal } from './components/CodexRecoveryModal';
+import { AntigravityRecoveryModal } from './components/AntigravityRecoveryModal';
 import {
+  AntigravityCandidate,
   CanonicalMessage,
   CodexScope,
   CodexThreadCandidate,
@@ -30,6 +32,9 @@ vi.mock('./api/client', () => ({
     publishToCodex: vi.fn(),
     resetConversations: vi.fn(),
     scanCodex: vi.fn(),
+    recoverCodexCandidates: vi.fn(),
+    scanAntigravity: vi.fn(),
+    recoverAntigravityCandidates: vi.fn(),
     getCodexVisibility: vi.fn(),
     pickFolderPath: vi.fn(),
     batchExportMarkdown: vi.fn(),
@@ -65,6 +70,9 @@ beforeEach(() => {
   vi.mocked(api.batchExportMarkdown).mockReset();
   vi.mocked(api.resetConversations).mockReset();
   vi.mocked(api.scanCodex).mockReset();
+  vi.mocked(api.recoverCodexCandidates).mockReset();
+  vi.mocked(api.scanAntigravity).mockReset();
+  vi.mocked(api.recoverAntigravityCandidates).mockReset();
   vi.mocked(api.setPinned).mockReset();
   vi.mocked(api.listFolderPins).mockResolvedValue([]);
   vi.mocked(api.setFolderPinned).mockReset();
@@ -467,4 +475,197 @@ test('a failed clear keeps the confirmation and existing conversations', async (
   expect(screen.getByText('Confirm Clear Database')).toBeTruthy();
   expect(sidebar().getByText('Active fixture')).toBeTruthy();
   expect(api.scanCodex).not.toHaveBeenCalled();
+});
+
+test('recovery modal preselects existing sessions with updates and keeps them visible when hiding up-to-date ones', async () => {
+  const makeAg = (
+    conversation_id: string,
+    exists_locally: boolean,
+    has_updates = false,
+  ): AntigravityCandidate => ({
+    conversation_id,
+    title: `AG ${conversation_id}`,
+    preview: '',
+    step_count: 4,
+    last_modified_time: '2026-11-13T12:00:00Z',
+    project_path: 'C:\\demo',
+    status: 'IDLE',
+    transcript_path: `C:\\ag\\${conversation_id}\\transcript.jsonl`,
+    has_full_transcript: false,
+    exists_locally,
+    has_updates,
+  });
+  const onConfirm = vi.fn().mockResolvedValue(undefined);
+  render(
+    <I18nProvider>
+      <AntigravityRecoveryModal
+        isOpen
+        onClose={() => {}}
+        isRecovering={false}
+        onConfirmRecovery={onConfirm}
+        report={{
+          home_directory: 'C:\\ag',
+          total_scanned: 3,
+          candidates: [
+            makeAg('brand-new', false, false),
+            makeAg('updated-existing', true, true),
+            makeAg('unchanged-existing', true, false),
+          ],
+          warnings: [],
+        }}
+      />
+    </I18nProvider>
+  );
+
+  expect(screen.getByText('Not Imported')).toBeTruthy();
+  expect(screen.getByText('Has Updates')).toBeTruthy();
+  expect(screen.getByText('Up to date')).toBeTruthy();
+  expect(screen.getByRole('button', { name: 'Recover Selected (2)' })).toBeTruthy();
+
+  const user = userEvent.setup();
+  await user.click(screen.getByLabelText('Hide already imported'));
+  expect(screen.getByText('AG brand-new')).toBeTruthy();
+  expect(screen.getByText('AG updated-existing')).toBeTruthy();
+  expect(screen.queryByText('AG unchanged-existing')).toBeNull();
+
+  await user.click(screen.getByRole('button', { name: 'Recover Selected (2)' }));
+  expect(onConfirm).toHaveBeenCalledWith([
+    expect.objectContaining({ conversation_id: 'brand-new' }),
+    expect.objectContaining({ conversation_id: 'updated-existing' }),
+  ]);
+});
+
+test('incremental recovery refreshes messages and metadata of the currently open conversation immediately', async () => {
+  const agConv: ConversationSummary = {
+    ...active,
+    id: 'ag-open',
+    title: 'Initial AG Session',
+    source_kind: 'antigravity',
+    message_count: 1,
+  };
+  let currentSummary = agConv;
+  let currentMessages: CanonicalMessage[] = [
+    {
+      id: 'm1',
+      conversation_id: 'ag-open',
+      sequence_no: 1,
+      role: 'user',
+      content: 'First question',
+      status: 'complete',
+      source_type: 'antigravity_local',
+      created_at: '2026-11-13T10:00:00Z',
+      updated_at: '2026-11-13T10:00:00Z',
+    },
+  ];
+
+  vi.mocked(api.listConversations).mockImplementation(async (isArchived = false) =>
+    isArchived ? [] : [currentSummary]);
+  vi.mocked(api.getConversation).mockImplementation(async () => asConversation(currentSummary));
+  vi.mocked(api.getMessages).mockImplementation(async () => [...currentMessages]);
+
+  const updatedCandidate: AntigravityCandidate = {
+    conversation_id: 'ext-ag-1',
+    title: 'Initial AG Session (Updated)',
+    preview: 'Latest reply',
+    step_count: 4,
+    last_modified_time: '2026-11-13T11:00:00Z',
+    project_path: 'C:\\demo',
+    status: 'IDLE',
+    transcript_path: 'C:\\ag\\ext-ag-1\\transcript.jsonl',
+    has_full_transcript: false,
+    exists_locally: true,
+    has_updates: true,
+  };
+  vi.mocked(api.scanAntigravity).mockResolvedValue({
+    home_directory: 'C:\\ag',
+    total_scanned: 1,
+    candidates: [updatedCandidate],
+    warnings: [],
+  });
+  vi.mocked(api.recoverAntigravityCandidates).mockImplementation(async () => {
+    currentSummary = {
+      ...currentSummary,
+      title: 'Initial AG Session (Updated)',
+      message_count: 2,
+      updated_at: '2026-11-13T11:00:00Z',
+    };
+    currentMessages = [
+      ...currentMessages,
+      {
+        id: 'm2',
+        conversation_id: 'ag-open',
+        sequence_no: 2,
+        role: 'assistant',
+        content: 'Newly appended assistant answer',
+        status: 'complete',
+        source_type: 'antigravity_local',
+        created_at: '2026-11-13T11:00:00Z',
+        updated_at: '2026-11-13T11:00:00Z',
+      },
+    ];
+    return {
+      conversation_count: 1,
+      new_conversation_count: 0,
+      message_count: 1,
+      title_update_count: 1,
+      skipped_count: 0,
+      warnings: [],
+    };
+  });
+
+  const user = userEvent.setup();
+  render(<I18nProvider><App /></I18nProvider>);
+  await user.click(screen.getByTitle('Antigravity'));
+  await screen.findByRole('heading', { name: 'Initial AG Session' });
+  await screen.findByText('First question');
+  expect(screen.queryByText('Newly appended assistant answer')).toBeNull();
+
+  await user.click(screen.getByRole('button', { name: 'Scan' }));
+  await screen.findByText('Scan & Recover Antigravity Conversations');
+  await user.click(screen.getByRole('button', { name: 'Recover Selected (1)' }));
+
+  await screen.findByRole('heading', { name: 'Initial AG Session (Updated)' });
+  await screen.findByText('Newly appended assistant answer');
+  expect(screen.getByText('2 messages')).toBeTruthy();
+});
+
+test('message bubbles turn file:/// links and python code blocks into PrismStudio actions', async () => {
+  const onOpenLocalFile = vi.fn();
+  const onSendCodeToPrism = vi.fn();
+  const message: CanonicalMessage = {
+    id: 'msg-prism',
+    conversation_id: 'c1',
+    sequence_no: 1,
+    role: 'assistant',
+    content:
+      'Updated [App.tsx](file:///D:/tools/md-pdf-viewer/src/App.tsx#L88-L96):\n```python\nprint("hello prism")\n```',
+    status: 'complete',
+    source_type: 'antigravity_transcript',
+    created_at: '2026-11-15T10:00:00Z',
+    updated_at: '2026-11-15T10:00:00Z',
+  };
+
+  const user = userEvent.setup();
+  render(
+    <I18nProvider>
+      <MessageBubble
+        message={message}
+        onOpenLocalFile={onOpenLocalFile}
+        onSendCodeToPrism={onSendCodeToPrism}
+      />
+    </I18nProvider>
+  );
+
+  await user.click(screen.getByRole('button', { name: /App\.tsx/i }));
+  expect(onOpenLocalFile).toHaveBeenCalledWith(
+    'D:\\tools\\md-pdf-viewer\\src\\App.tsx',
+    88
+  );
+
+  await user.click(screen.getByRole('button', { name: /Run in Prism/i }));
+  expect(onSendCodeToPrism).toHaveBeenCalledWith(
+    'python',
+    'print("hello prism")',
+    true
+  );
 });

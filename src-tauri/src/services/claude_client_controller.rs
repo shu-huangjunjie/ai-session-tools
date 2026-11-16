@@ -2,9 +2,10 @@ use std::os::windows::process::CommandExt;
 use std::process::Command;
 
 use super::process_util::{any_running, stop_processes, wait_until};
+use super::quick_launch::{find_msix_package_dir_name, is_executable_or_alias};
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-const PROCESS_NAMES: &[&str] = &["claude.exe"];
+const PROCESS_NAMES: &[&str] = &["claude.exe", "claude-desktop.exe"];
 
 pub struct ClaudeClientController;
 
@@ -23,11 +24,21 @@ impl ClaudeClientController {
     }
 
     pub fn start(&self, timeout_s: f64) -> Result<(), String> {
-        let local_app = dirs::data_local_dir()
-            .map(|d| d.join("Programs").join("Claude").join("Claude.exe"));
+        let exe_path = dirs::data_local_dir().and_then(|d| {
+            [
+                d.join("Programs").join("Claude").join("Claude.exe"),
+                d.join("AnthropicClaude").join("claude.exe"),
+            ]
+            .into_iter()
+            .find(|p| is_executable_or_alias(p))
+        });
 
-        let res = if let Some(p) = local_app.filter(|p| p.is_file()) {
+        let res = if let Some(p) = exe_path {
             Command::new(p).spawn()
+        } else if let Some(pkg) = find_msix_package_dir_name("Claude_") {
+            Command::new("explorer.exe")
+                .arg(format!("shell:AppsFolder\\{}!Claude", pkg))
+                .spawn()
         } else {
             Command::new("cmd")
                 .args(["/c", "start", "", "claude"])

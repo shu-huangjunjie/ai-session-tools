@@ -38,12 +38,14 @@ vite.config.d.ts
 .env
 .env.*
 !.env.example
+oauth-clients.local.json
 
 # App local runtime data (Portable mode data directory)
 data/
 backups/
 imports/reports/
 context_restoration_data/
+.context-vault/
 *.db
 *.db-wal
 *.db-shm
@@ -64,3 +66,6 @@ Context Vault 便携版/
 dist-portable/
 *.exe.bak
 *.pdb
+
+# Third-party reference source code
+reference/

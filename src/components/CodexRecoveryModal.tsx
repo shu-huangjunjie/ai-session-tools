@@ -51,10 +51,10 @@ export const CodexRecoveryModal: React.FC<CodexRecoveryModalProps> = ({
   // Initialize selection when report arrives
   React.useEffect(() => {
     if (report) {
-      // By default select candidates that do NOT exist locally yet and that Codex lists.
+      // By default select candidates that are new or have updates and that Codex lists.
       const initial = new Set(
         report.candidates
-          .filter((c) => !c.exists_locally && c.codex_scope !== 'hidden')
+          .filter((c) => (!c.exists_locally || Boolean(c.has_updates)) && c.codex_scope !== 'hidden')
           .map((c) => c.thread_id)
       );
       setSelectedIds(initial);
@@ -66,7 +66,7 @@ export const CodexRecoveryModal: React.FC<CodexRecoveryModalProps> = ({
     if (!report) return [];
     let list = report.candidates;
     if (hideExisting) {
-      list = list.filter((c) => !c.exists_locally);
+      list = list.filter((c) => !c.exists_locally || Boolean(c.has_updates));
     }
     const q = filterText.trim().toLowerCase();
     if (q) {
@@ -332,10 +332,17 @@ export const CodexRecoveryModal: React.FC<CodexRecoveryModalProps> = ({
 
                             <div className="flex items-center gap-2 ml-2 flex-shrink-0">
                               {cand.exists_locally ? (
-                                <span className="flex items-center gap-1 text-[10px] text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20 font-medium">
-                                  <CheckCircle2 size={10} />
-                                  {t.modals.badgeIncremental}
-                                </span>
+                                cand.has_updates ? (
+                                  <span className="flex items-center gap-1 text-[10px] text-amber-600 dark:text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded-full border border-amber-500/25 font-medium">
+                                    <RefreshCw size={10} />
+                                    {t.modals.badgeHasUpdates}
+                                  </span>
+                                ) : (
+                                  <span className="flex items-center gap-1 text-[10px] text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20 font-medium">
+                                    <CheckCircle2 size={10} />
+                                    {t.modals.badgeUpToDate}
+                                  </span>
+                                )
                               ) : (
                                 <span className="text-[10px] text-[#0071e3] dark:text-[#2997ff] bg-[#0071e3]/10 px-2 py-0.5 rounded-full border border-[#0071e3]/20 font-medium">
                                   {t.modals.badgeNotImported}

@@ -16,9 +16,10 @@ use persistence::{Database, Repository};
 pub struct AppState {
     pub paths: AppPaths,
     pub database: Arc<Database>,
+    pub bridge_queue: Arc<services::VaultBridgeQueue>,
 }
 
-fn initialize() -> Result<AppState, String> {
+fn initialize(initial_focus: Option<services::VaultFocusPayload>) -> Result<AppState, String> {
     let paths =
         AppPaths::discover(None).map_err(|e| format!("无法创建应用数据目录：{}", e))?;
     let database = Database::new(&paths.database, &paths.backups).map_err(|e| {
@@ -40,7 +41,77 @@ fn initialize() -> Result<AppState, String> {
     let _ = services::CodexRecoveryService::new(&database, Some(&paths.codex_home()))
         .refresh_existing_titles();
 
-    Ok(AppState { paths, database })
+    let bridge_queue = Arc::new(services::VaultBridgeQueue::default());
+    if let Some(mut focus) = initial_focus {
+        if let Some(ref cid) = focus.conversation_id.clone() {
+            if let Some((resolved_id, sk)) = services::resolve_vault_conversation(&database, cid) {
+                focus.conversation_id = Some(resolved_id);
+                focus.source_kind = Some(sk);
+            }
+        }
+        bridge_queue.push(focus);
+    }
+
+    Ok(AppState {
+        paths,
+        database,
+        bridge_queue,
+    })
+}
+
+fn handle_cli_headless_or_handoff() -> Result<Option<services::VaultFocusPayload>, ()> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    let mut handoff_focus: Option<services::VaultFocusPayload> = None;
+
+    while i < args.len() {
+        if args[i] == "--headless-bridge-query" && i + 1 < args.len() {
+            let req_path = std::path::PathBuf::from(&args[i + 1]);
+            let resp = match services::load_handoff_file::<services::VaultHeadlessOrRpcRequest>(&req_path) {
+                Some(req) => match services::discover_best_vault_paths() {
+                    Ok(paths) => match Database::new(&paths.database, &paths.backups) {
+                        Ok(db) => services::execute_vault_data_query(&db, &req),
+                        Err(e) => services::BridgeResponse {
+                            ok: false,
+                            error: Some(format!("打开会话数据库失败: {e}")),
+                            data: None,
+                        },
+                    },
+                    Err(e) => services::BridgeResponse {
+                        ok: false,
+                        error: Some(format!("发现数据目录失败: {e}")),
+                        data: None,
+                    },
+                },
+                None => services::BridgeResponse {
+                    ok: false,
+                    error: Some("无法读取无界面查询参数".to_string()),
+                    data: None,
+                },
+            };
+            if let Ok(json) = serde_json::to_string(&resp) {
+                println!("{json}");
+            }
+            return Err(());
+        } else if args[i] == "--bridge-handoff" && i + 1 < args.len() {
+            let handoff_path = std::path::PathBuf::from(&args[i + 1]);
+            handoff_focus = services::load_handoff_file::<services::VaultFocusPayload>(&handoff_path);
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+
+    let forward_payload = handoff_focus.clone().unwrap_or(services::VaultFocusPayload {
+        conversation_id: None,
+        source_kind: None,
+        project_path: None,
+    });
+    if services::try_forward_to_running_vault(Some(forward_payload)) {
+        return Err(());
+    }
+
+    Ok(handoff_focus)
 }
 
 /// A windowless release build has no console, so startup failures must be shown.
@@ -66,7 +137,12 @@ fn report_startup_error(message: &str) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let state = match initialize() {
+    let initial_focus = match handle_cli_headless_or_handoff() {
+        Ok(f) => f,
+        Err(()) => return,
+    };
+
+    let state = match initialize(initial_focus) {
         Ok(state) => state,
         Err(message) => {
             report_startup_error(&message);
@@ -74,9 +150,22 @@ pub fn run() {
         }
     };
 
+    let bridge_paths = state.paths.clone();
+    let bridge_db = state.database.clone();
+    let bridge_queue = state.bridge_queue.clone();
+
     if let Err(e) = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(state)
+        .setup(move |app| {
+            services::start_vault_bridge_server(
+                app.handle().clone(),
+                &bridge_paths,
+                bridge_db,
+                bridge_queue,
+            );
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             // Conversations
             commands::list_conversations,
@@ -91,6 +180,7 @@ pub fn run() {
             commands::reset_conversations,
             commands::get_messages,
             commands::search_conversations,
+            commands::handoff_conversation,
 
             // Codex operations
             commands::scan_codex,
@@ -143,15 +233,28 @@ pub fn run() {
             commands::list_accounts,
             commands::save_current_account,
             commands::import_account_file,
+            commands::submit_account_login_callback,
             commands::login_account,
+            commands::start_codex_device_login,
+            commands::complete_codex_device_login,
             commands::import_account_tokens,
             commands::cancel_account_login,
             commands::switch_account,
             commands::delete_account,
+            commands::update_account_meta,
+            commands::batch_update_account_tags,
+            commands::batch_delete_accounts,
             commands::refresh_account_quota,
             commands::refresh_all_account_quotas,
             commands::upsert_claude_provider,
+            commands::upsert_codex_provider,
+            commands::test_provider_connection,
+            commands::import_cc_switch_providers,
             commands::import_cc_switch_claude_providers,
+            commands::import_cockpit_tools_accounts,
+            commands::export_accounts_json,
+            commands::launch_account_cli,
+            commands::launch_account_target,
 
             // Importers
             commands::preview_import,
@@ -164,11 +267,22 @@ pub fn run() {
             commands::export_json,
             commands::open_folder,
             commands::open_vscode,
+            commands::get_prism_studio_status,
+            commands::open_in_prism_studio,
+            commands::send_code_to_prism_studio,
+            commands::open_conversation_in_prism_studio,
+            commands::drain_vault_bridge_focus,
+            commands::resolve_conversation_link,
+            commands::open_external_url,
             commands::get_app_paths,
             commands::pick_save_path,
             commands::pick_open_path,
             commands::pick_auth_json_path,
             commands::pick_folder_path,
+            commands::pick_executable_path,
+            commands::list_quick_launch_tools,
+            commands::launch_quick_tool,
+            commands::set_quick_launch_custom_path,
         ])
         .run(tauri::generate_context!())
     {

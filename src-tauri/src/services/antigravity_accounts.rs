@@ -23,12 +23,12 @@ use chrono::{TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 
-use super::account_store::{self, AccountView, AccountsState, CurrentLogin, Quota, QuotaState, QuotaWindow};
+use super::account_store::{self, AccountMeta, AccountView, AccountsState, CurrentLogin, Quota, QuotaState, QuotaWindow};
 use super::win_http::{self, HttpFn};
 
-/// 属于账号的 `ItemTable` 键。
+
+/// 属于账号的 `ItemTable` 键（旧版 Antigravity `state.vscdb`）。
 pub const KEYS: &[&str] = &[
     "antigravityAuthStatus",
     "antigravityUnifiedStateSync.oauthToken",
@@ -41,10 +41,20 @@ const AUTH_KEY: &str = "antigravityAuthStatus";
 const TOKEN_KEY: &str = "antigravityUnifiedStateSync.oauthToken";
 const TOKEN_SENTINEL: &str = "oauthTokenInfoSentinelKey";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-const CLOUD_CODE: &str = "https://cloudcode-pa.googleapis.com";
-const USER_AGENT: &str = "antigravity/1.20.5 windows/amd64";
+const CLOUD_CODE_ENDPOINTS: &[&str] = &[
+    "https://daily-cloudcode-pa.googleapis.com",
+    "https://cloudcode-pa.googleapis.com",
+];
+const USER_AGENT: &str = "antigravity/2.25.0 (aidev_client; os_type=windows; arch=amd64; cl=1003475615)";
 const STORE_FILE: &str = "antigravity.json";
 const DB_BACKUPS: usize = 10;
+
+const WIN_CRED_TARGET: &str = "gemini:antigravity";
+const WIN_CRED_USER: &str = "antigravity";
+const CRED_MAX_BYTES: usize = 2560;
+const CRED_FILE_PRIMARY: &str = "jetski-standalone-oauth-token";
+const CRED_FILE_CLI_DIR: &str = "antigravity-cli";
+const CRED_FILE_CLI_TOKEN: &str = "antigravity-oauth-token";
 
 /// `ItemTable` 中的一个值，保持原来的存储类型。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -64,6 +74,157 @@ impl Item {
     }
 }
 
+/// Windows 凭据管理器读写抽象，测试中用内存实现保持完全隔离。
+pub trait CredStore: Send + Sync {
+    fn is_enabled(&self) -> bool {
+        true
+    }
+    fn read_secret(&self) -> Result<Option<String>, String>;
+    fn write_secret(&self, payload: &str) -> Result<(), String>;
+}
+
+struct NullCredStore;
+
+impl CredStore for NullCredStore {
+    fn is_enabled(&self) -> bool {
+        false
+    }
+    fn read_secret(&self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    fn write_secret(&self, _payload: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+struct WinCredStore;
+
+#[cfg(windows)]
+mod win_cred_ffi {
+    use core::ffi::c_void;
+    use std::ptr;
+
+    const CRED_TYPE_GENERIC: u32 = 1;
+    const CRED_PERSIST_LOCAL_MACHINE: u32 = 2;
+    const ERROR_NOT_FOUND: i32 = 1168;
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    struct CredentialW {
+        flags: u32,
+        cred_type: u32,
+        target_name: *mut u16,
+        comment: *mut u16,
+        last_written: FileTime,
+        credential_blob_size: u32,
+        credential_blob: *mut u8,
+        persist: u32,
+        attribute_count: u32,
+        attributes: *mut c_void,
+        target_alias: *mut u16,
+        user_name: *mut u16,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn CredReadW(target_name: *const u16, cred_type: u32, flags: u32, credential: *mut *mut CredentialW) -> i32;
+        fn CredWriteW(credential: *const CredentialW, flags: u32) -> i32;
+        fn CredFree(buffer: *const c_void);
+    }
+
+    fn wide_z(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    pub fn read(target: &str) -> Result<Option<String>, String> {
+        let target_w = wide_z(target);
+        let mut ptr: *mut CredentialW = ptr::null_mut();
+        let ok = unsafe { CredReadW(target_w.as_ptr(), CRED_TYPE_GENERIC, 0, &mut ptr) };
+        if ok == 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(ERROR_NOT_FOUND) {
+                return Ok(None);
+            }
+            return Err(format!("读取 Windows 凭据管理器失败：{}", err));
+        }
+        struct Guard(*mut CredentialW);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe { CredFree(self.0.cast()) };
+                }
+            }
+        }
+        let _guard = Guard(ptr);
+        let cred = unsafe { &*ptr };
+        if cred.credential_blob.is_null() || cred.credential_blob_size == 0 {
+            return Ok(None);
+        }
+        let bytes = unsafe { core::slice::from_raw_parts(cred.credential_blob, cred.credential_blob_size as usize) };
+        let text = String::from_utf8_lossy(bytes).trim().to_string();
+        Ok((!text.is_empty()).then_some(text))
+    }
+
+    pub fn write(target: &str, user: &str, payload: &str) -> Result<(), String> {
+        let mut target_w = wide_z(target);
+        let mut user_w = wide_z(user);
+        let mut bytes = payload.as_bytes().to_vec();
+        let cred = CredentialW {
+            flags: 0,
+            cred_type: CRED_TYPE_GENERIC,
+            target_name: target_w.as_mut_ptr(),
+            comment: ptr::null_mut(),
+            last_written: FileTime { low: 0, high: 0 },
+            credential_blob_size: bytes.len() as u32,
+            credential_blob: bytes.as_mut_ptr(),
+            persist: CRED_PERSIST_LOCAL_MACHINE,
+            attribute_count: 0,
+            attributes: ptr::null_mut(),
+            target_alias: ptr::null_mut(),
+            user_name: user_w.as_mut_ptr(),
+        };
+        let ok = unsafe { CredWriteW(&cred, 0) };
+        if ok == 0 {
+            return Err(format!("写入 Windows 凭据管理器失败：{}", std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+}
+
+impl CredStore for WinCredStore {
+    fn is_enabled(&self) -> bool {
+        cfg!(windows)
+    }
+
+    fn read_secret(&self) -> Result<Option<String>, String> {
+        #[cfg(windows)]
+        {
+            win_cred_ffi::read(WIN_CRED_TARGET)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(None)
+        }
+    }
+
+    fn write_secret(&self, payload: &str) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            win_cred_ffi::write(WIN_CRED_TARGET, WIN_CRED_USER, payload)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = payload;
+            Ok(())
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredAccount {
     id: String,
@@ -72,7 +233,7 @@ struct StoredAccount {
     name: Option<String>,
     /// [`KEYS`] 中存在的项。
     items: Map<String, Value>,
-    /// 登录项是按 token 合成的（浏览器授权或导入），还没有 Antigravity 写下的完整快照。
+    /// 登录项是按 token 合成的（浏览器授权、导入或 2.0 CLI），还没有旧版 `state.vscdb` 快照。
     #[serde(default)]
     synthetic: bool,
     /// 刷新成功时用的 OAuth client id。
@@ -83,10 +244,14 @@ struct StoredAccount {
     #[serde(default)]
     access_expires_at: Option<i64>,
     #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
     project_id: Option<String>,
     added_at: String,
     #[serde(default)]
     last_used_at: Option<String>,
+    #[serde(default, flatten)]
+    meta: AccountMeta,
     #[serde(flatten)]
     quota: QuotaState,
 }
@@ -115,19 +280,60 @@ pub fn default_state_db() -> PathBuf {
     candidates.iter().find(|p| p.is_file()).cloned().unwrap_or_else(|| candidates[0].clone())
 }
 
+struct LiveLogin {
+    email: Option<String>,
+    name: Option<String>,
+    access_token: String,
+    refresh_token: String,
+    expires_at: Option<i64>,
+    id_token: Option<String>,
+    db_items: Option<Map<String, Value>>,
+}
+
 pub struct AntigravityAccountManager {
     db: PathBuf,
     store_path: PathBuf,
     backups: PathBuf,
+    gemini_home: Option<PathBuf>,
+    cred_store: Box<dyn CredStore>,
 }
 
 impl AntigravityAccountManager {
+    /// 测试隔离构造方法：不触碰系统 Windows 凭据管理器与真实 `~/.gemini`。
     pub fn new(db: &Path, data_dir: &Path, backups: &Path) -> Self {
+        Self::new_with_cred_store(db, data_dir, backups, None, Box::new(NullCredStore))
+    }
+
+    /// 生产环境构造方法：同时支持 Antigravity 2.0（Windows 凭据管理器 + `~/.gemini`）与 1.x `state.vscdb`。
+    pub fn new_live(db: &Path, data_dir: &Path, backups: &Path, gemini_home: Option<PathBuf>) -> Self {
+        Self::new_with_cred_store(db, data_dir, backups, gemini_home, Box::new(WinCredStore))
+    }
+
+    pub fn new_with_cred_store(
+        db: &Path,
+        data_dir: &Path,
+        backups: &Path,
+        gemini_home: Option<PathBuf>,
+        cred_store: Box<dyn CredStore>,
+    ) -> Self {
         Self {
             db: db.to_path_buf(),
             store_path: data_dir.join("accounts").join(STORE_FILE),
             backups: backups.join("accounts").join("antigravity"),
+            gemini_home,
+            cred_store,
         }
+    }
+
+    fn has_v2_target(&self) -> bool {
+        if self.cred_store.is_enabled() {
+            return true;
+        }
+        self.gemini_home.as_ref().is_some_and(|home| {
+            home.is_dir()
+                || home.join(CRED_FILE_PRIMARY).is_file()
+                || home.join(CRED_FILE_CLI_DIR).is_dir()
+        })
     }
 
     fn load(&self) -> Result<Store, String> {
@@ -138,8 +344,8 @@ impl AntigravityAccountManager {
         account_store::save_json(&self.store_path, &json!({ "version": 1, "accounts": store.accounts }))
     }
 
-    /// 当前登录的快照；数据库不存在或没有登录时为空。
-    fn read_live(&self) -> Result<Option<Map<String, Value>>, String> {
+    /// 读取旧版 `state.vscdb` 中的登录快照。
+    fn read_live_db(&self) -> Result<Option<Map<String, Value>>, String> {
         if !self.db.is_file() {
             return Ok(None);
         }
@@ -161,59 +367,202 @@ impl AntigravityAccountManager {
         Ok(items.contains_key(AUTH_KEY).then_some(items))
     }
 
+    fn read_live_v2(&self) -> Result<Option<LiveLogin>, String> {
+        let mut raw_candidates: Vec<String> = Vec::new();
+        if let Some(secret) = self.cred_store.read_secret()? {
+            raw_candidates.push(secret);
+        }
+        if let Some(home) = &self.gemini_home {
+            for rel in [
+                home.join(CRED_FILE_PRIMARY),
+                home.join(CRED_FILE_CLI_DIR).join(CRED_FILE_CLI_TOKEN),
+            ] {
+                if let Ok(text) = std::fs::read_to_string(&rel) {
+                    if !text.trim().is_empty() {
+                        raw_candidates.push(text);
+                    }
+                }
+            }
+        }
+        for raw in raw_candidates {
+            if let Some(parsed) = parse_v2_credential_json(&raw) {
+                return Ok(Some(parsed));
+            }
+        }
+        Ok(None)
+    }
+
+    fn read_live_login(&self, store: &Store) -> Result<Option<LiveLogin>, String> {
+        if let Some(mut live_v2) = self.read_live_v2()? {
+            if live_v2.email.is_none() {
+                if let Some(matched) = store.accounts.iter().find(|a| {
+                    token_info(&a.items)
+                        .is_some_and(|(_, r, _)| r == live_v2.refresh_token)
+                }) {
+                    live_v2.email = Some(matched.email.clone());
+                    live_v2.name = matched.name.clone();
+                } else if let Ok(Some(db_items)) = self.read_live_db() {
+                    if token_info(&db_items).is_some_and(|(_, r, _)| r == live_v2.refresh_token) {
+                        if let Some((email, name)) = identity(db_items.get(AUTH_KEY)) {
+                            live_v2.email = Some(email);
+                            live_v2.name = name;
+                        }
+                        live_v2.db_items = Some(db_items);
+                    }
+                }
+            }
+            return Ok(Some(live_v2));
+        }
+
+        let Some(items) = self.read_live_db()? else {
+            return Ok(None);
+        };
+        let (email, name) = identity(items.get(AUTH_KEY))
+            .map(|(e, n)| (Some(e), n))
+            .unwrap_or((None, None));
+        let Some((access_token, refresh_token, expires_at)) = token_info(&items) else {
+            return Ok(None);
+        };
+        Ok(Some(LiveLogin {
+            email,
+            name,
+            access_token,
+            refresh_token,
+            expires_at,
+            id_token: None,
+            db_items: Some(items),
+        }))
+    }
+
+    fn auth_path_label(&self) -> String {
+        if self.db.is_file() {
+            return self.db.to_string_lossy().to_string();
+        }
+        if self.cred_store.is_enabled() {
+            return format!("Windows 凭据管理器 ({})", WIN_CRED_TARGET);
+        }
+        if let Some(home) = &self.gemini_home {
+            return home.join(CRED_FILE_PRIMARY).to_string_lossy().to_string();
+        }
+        self.db.to_string_lossy().to_string()
+    }
+
     pub fn state(&self) -> Result<AccountsState, String> {
         let store = self.load()?;
-        let live = self.read_live().unwrap_or(None);
-        let live_identity = live.as_ref().and_then(|items| identity(items.get(AUTH_KEY)));
-        let live_email = live_identity.as_ref().map(|(e, _)| e.to_lowercase());
-        let current = live_identity.map(|(email, name)| CurrentLogin {
-            saved: store.accounts.iter().any(|a| a.email.to_lowercase() == email.to_lowercase()),
-            email: Some(email),
-            name,
-            ..Default::default()
+        let live = self.read_live_login(&store).unwrap_or(None);
+        let live_email = live.as_ref().and_then(|l| l.email.as_ref()).map(|e| e.to_lowercase());
+        let live_rt = live.as_ref().map(|l| l.refresh_token.clone());
+        let matched_stored = live.as_ref().and_then(|l| {
+            store.accounts.iter().find(|a| {
+                live_email
+                    .as_deref()
+                    .is_some_and(|e| a.email.eq_ignore_ascii_case(e))
+                    || token_info(&a.items).is_some_and(|(_, r, _)| r == l.refresh_token)
+            })
         });
+        let current = live.map(|l| {
+            let email = l.email.or_else(|| matched_stored.map(|a| a.email.clone()));
+            let name = l.name.or_else(|| matched_stored.and_then(|a| a.name.clone()));
+            CurrentLogin {
+                saved: matched_stored.is_some(),
+                email,
+                name,
+                ..Default::default()
+            }
+        });
+        let current_note = (!self.db.is_file() && !self.has_v2_target())
+            .then(|| format!("没有找到 Antigravity 的数据库或凭据存储：{}", self.db.display()));
         Ok(AccountsState {
-            auth_path: self.db.to_string_lossy().to_string(),
+            auth_path: self.auth_path_label(),
             current,
-            current_note: (!self.db.is_file()).then(|| format!("没有找到 Antigravity 的数据库：{}", self.db.display())),
+            current_note,
             notes: Vec::new(),
-            accounts: store.accounts.iter().map(|a| view(a, live_email.as_deref() == Some(a.email.to_lowercase().as_str()))).collect(),
+            accounts: store
+                .accounts
+                .iter()
+                .map(|a| {
+                    let is_cur = live_email
+                        .as_deref()
+                        .is_some_and(|e| a.email.eq_ignore_ascii_case(e))
+                        || live_rt.as_deref().is_some_and(|rt| {
+                            token_info(&a.items).is_some_and(|(_, r, _)| r == rt)
+                        });
+                    view(a, is_cur)
+                })
+                .collect(),
+            cockpit_import_count: 0,
+            cc_switch_available: false,
         })
     }
 
-    /// 保存当前登录（已保存则用 Antigravity 的最新数据覆盖），返回账号 id。
+    /// 保存当前登录（已保存则用最新数据覆盖），返回账号 id。
     pub fn save_current(&self) -> Result<String, String> {
-        let items = self.read_live()?.ok_or("当前没有 Antigravity 登录")?;
-        let (email, name) = identity(items.get(AUTH_KEY)).ok_or("Antigravity 的登录信息里没有邮箱")?;
-        if token_info(&items).is_none() {
-            return Err("Antigravity 的登录信息里没有 token，请在 Antigravity 中重新登录".into());
-        }
+        self.save_current_with(&win_http::request)
+    }
+
+    fn save_current_with(&self, http: &HttpFn<'_>) -> Result<String, String> {
         let mut store = self.load()?;
+        let live = self.read_live_login(&store)?.ok_or("当前没有 Antigravity 登录")?;
+        let (email, name) = match live.email.clone() {
+            Some(email) => (email, live.name.clone()),
+            None => fetch_google_profile(&live.access_token, http)
+                .ok_or("Antigravity 当前登录缺少邮箱信息，请重试或通过 OAuth 重新授权")?,
+        };
+        let expires_at = live.expires_at.unwrap_or_else(|| Utc::now().timestamp() + 3600);
         let id = match store.accounts.iter_mut().find(|a| a.email.eq_ignore_ascii_case(&email)) {
             Some(existing) => {
-                if existing.items != items {
-                    existing.items = items;
-                    existing.access_token = None;
-                    existing.access_expires_at = None;
+                if let Some(db_items) = live.db_items {
+                    if existing.items != db_items {
+                        existing.items = db_items;
+                    }
+                    existing.synthetic = false;
+                } else {
+                    existing.items = synth_items(
+                        &email,
+                        name.as_deref().or(existing.name.as_deref()),
+                        &live.access_token,
+                        &live.refresh_token,
+                        expires_at,
+                        existing.project_id.as_deref(),
+                    );
                 }
-                existing.synthetic = false;
-                existing.name = name;
+                existing.access_token = Some(live.access_token);
+                existing.access_expires_at = live.expires_at;
+                if live.id_token.is_some() {
+                    existing.id_token = live.id_token;
+                }
+                if name.is_some() {
+                    existing.name = name;
+                }
                 existing.id.clone()
             }
             None => {
                 let id = account_store::new_id();
+                let synthetic = live.db_items.is_none();
+                let items = live.db_items.unwrap_or_else(|| {
+                    synth_items(
+                        &email,
+                        name.as_deref(),
+                        &live.access_token,
+                        &live.refresh_token,
+                        expires_at,
+                        None,
+                    )
+                });
                 store.accounts.push(StoredAccount {
                     id: id.clone(),
                     email,
                     name,
                     items,
-                    synthetic: false,
+                    synthetic,
                     client_id: None,
-                    access_token: None,
-                    access_expires_at: None,
+                    access_token: Some(live.access_token),
+                    access_expires_at: live.expires_at,
+                    id_token: live.id_token,
                     project_id: None,
                     added_at: account_store::now(),
                     last_used_at: None,
+                    meta: AccountMeta::default(),
                     quota: QuotaState::default(),
                 });
                 id
@@ -223,50 +572,99 @@ impl AntigravityAccountManager {
         Ok(id)
     }
 
-    /// 切换账号。调用方须先确认 Antigravity 已关闭。
+    /// 切换账号。若使用旧版 IDE 数据库，调用方须先确认 Antigravity 已关闭。
     pub fn switch(&self, id: &str) -> Result<(), String> {
         self.switch_with(id, &win_http::request, &|| oauth_clients().to_vec())
     }
 
     fn switch_with(&self, id: &str, http: &HttpFn<'_>, clients: &dyn Fn() -> Vec<(String, String)>) -> Result<(), String> {
-        if !self.db.is_file() {
-            return Err(format!("没有找到 Antigravity 的数据库：{}", self.db.display()));
+        let has_db = self.db.is_file();
+        let has_v2 = self.has_v2_target();
+        if !has_db && !has_v2 {
+            return Err(format!("没有找到 Antigravity 的数据库或凭据存储：{}", self.db.display()));
         }
-        if self.read_live()?.is_some() {
-            self.save_current()?;
+        {
+            let store = self.load()?;
+            if self.read_live_login(&store)?.is_some() {
+                let _ = self.save_current_with(http);
+            }
         }
         let mut store = self.load()?;
         let target = store.accounts.iter_mut().find(|a| a.id == id).ok_or("账号不存在")?;
-        if target.synthetic {
-            // 合成的登录项带的 access token 多半已过期：先换一个新的，换不到就让 Antigravity 自己用 refresh token 换。
-            if let Some((_, refresh_token, _)) = token_info(&target.items) {
-                if let Ok((client_id, access, expires_at)) = refresh(&refresh_token, target.client_id.as_deref(), http, clients) {
-                    target.items = synth_items(&target.email, target.name.as_deref(), &access, &refresh_token, expires_at, target.project_id.as_deref());
+        let (mut access_for_v2, refresh_for_v2, mut exp_for_v2) =
+            token_info(&target.items).unwrap_or_else(|| {
+                (
+                    target.access_token.clone().unwrap_or_default(),
+                    String::new(),
+                    target.access_expires_at,
+                )
+            });
+
+        let needs_v2_refresh = has_v2 && exp_for_v2.is_none_or(|exp| exp - 60 <= Utc::now().timestamp());
+        if target.synthetic || needs_v2_refresh {
+            if !refresh_for_v2.is_empty() {
+                if let Ok((client_id, access, expires_at)) = refresh(&refresh_for_v2, target.client_id.as_deref(), http, clients) {
+                    access_for_v2 = access.clone();
+                    exp_for_v2 = Some(expires_at);
+                    target.items = synth_items(&target.email, target.name.as_deref(), &access, &refresh_for_v2, expires_at, target.project_id.as_deref());
                     target.client_id = Some(client_id);
                     target.access_token = Some(access);
                     target.access_expires_at = Some(expires_at);
                 }
             }
         }
-        let bytes = std::fs::read(&self.db).map_err(|e| format!("读取 Antigravity 数据库失败：{}", e))?;
-        account_store::backup(&self.backups, "state.vscdb", &bytes, DB_BACKUPS)?;
 
-        let mut conn = Connection::open(&self.db).map_err(|e| format!("打开 Antigravity 数据库失败：{}", e))?;
-        let tx = conn.transaction().map_err(|e| format!("写入 Antigravity 数据库失败：{}", e))?;
-        for key in KEYS {
-            match target.item(key) {
-                Some(Item::Text(s)) => tx.execute("INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)", rusqlite::params![key, s]),
-                Some(Item::Blob(b)) => {
-                    let blob = account_store::base64_decode(&b).ok_or("账号数据损坏")?;
-                    tx.execute("INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)", rusqlite::params![key, blob])
-                }
-                None => tx.execute("DELETE FROM ItemTable WHERE key = ?1", [key]),
+        // Antigravity 2.0+：写入 Windows 凭据管理器 + `~/.gemini` 令牌文件。
+        if has_v2 {
+            if refresh_for_v2.is_empty() && access_for_v2.is_empty() {
+                return Err("该账号缺少 OAuth token，请重新登录或导入".into());
             }
-            .map_err(|e| format!("写入 Antigravity 数据库失败：{}", e))?;
+            let payload = build_credential_payload(
+                &access_for_v2,
+                &refresh_for_v2,
+                exp_for_v2.unwrap_or_else(|| Utc::now().timestamp() + 3600),
+                target.id_token.as_deref(),
+            )?;
+            if self.cred_store.is_enabled() {
+                self.cred_store.write_secret(&payload)?;
+            }
+            if let Some(home) = &self.gemini_home {
+                let primary = home.join(CRED_FILE_PRIMARY);
+                let _ = account_store::backup_file(&self.backups, &primary);
+                account_store::atomic_write(&primary, payload.as_bytes())?;
+
+                let cli_dir = home.join(CRED_FILE_CLI_DIR);
+                if cli_dir.is_dir() {
+                    let cli_token = cli_dir.join(CRED_FILE_CLI_TOKEN);
+                    let _ = account_store::backup_file(&self.backups, &cli_token);
+                    account_store::atomic_write(&cli_token, payload.as_bytes())?;
+                }
+            }
         }
-        tx.execute("INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('antigravityOnboarding', 'true')", [])
-            .map_err(|e| format!("写入 Antigravity 数据库失败：{}", e))?;
-        tx.commit().map_err(|e| format!("写入 Antigravity 数据库失败：{}", e))?;
+
+        // Antigravity 1.x 旧版：若存在 state.vscdb，同时写入 SQLite ItemTable。
+        if has_db {
+            let bytes = std::fs::read(&self.db).map_err(|e| format!("读取 Antigravity 数据库失败：{}", e))?;
+            account_store::backup(&self.backups, "state.vscdb", &bytes, DB_BACKUPS)?;
+
+            let mut conn = Connection::open(&self.db).map_err(|e| format!("打开 Antigravity 数据库失败：{}", e))?;
+            let tx = conn.transaction().map_err(|e| format!("写入 Antigravity 数据库失败：{}", e))?;
+            for key in KEYS {
+                match target.item(key) {
+                    Some(Item::Text(s)) => tx.execute("INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)", rusqlite::params![key, s]),
+                    Some(Item::Blob(b)) => {
+                        let blob = account_store::base64_decode(&b).ok_or("账号数据损坏")?;
+                        tx.execute("INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)", rusqlite::params![key, blob])
+                    }
+                    None => tx.execute("DELETE FROM ItemTable WHERE key = ?1", [key]),
+                }
+                .map_err(|e| format!("写入 Antigravity 数据库失败：{}", e))?;
+            }
+            tx.execute("INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('antigravityOnboarding', 'true')", [])
+                .map_err(|e| format!("写入 Antigravity 数据库失败：{}", e))?;
+            tx.commit().map_err(|e| format!("写入 Antigravity 数据库失败：{}", e))?;
+        }
+
         target.last_used_at = Some(account_store::now());
         self.save(&store)
     }
@@ -281,6 +679,118 @@ impl AntigravityAccountManager {
         self.save(&store)
     }
 
+    pub fn update_meta(&self, id: &str, tags: Option<Vec<String>>, note: Option<Option<String>>) -> Result<(), String> {
+        let mut store = self.load()?;
+        let target = store.accounts.iter_mut().find(|a| a.id == id).ok_or("账号不存在")?;
+        target.meta.update(tags, note);
+        self.save(&store)
+    }
+
+    pub fn batch_update_tags(&self, ids: &[String], add: &[String], remove: &[String]) -> Result<usize, String> {
+        let mut store = self.load()?;
+        let mut count = 0usize;
+        for account in &mut store.accounts {
+            if ids.iter().any(|id| id == &account.id) {
+                if !add.is_empty() {
+                    account.meta.add_tags(add.iter().cloned());
+                }
+                if !remove.is_empty() {
+                    account.meta.remove_tags(remove);
+                }
+                count += 1;
+            }
+        }
+        self.save(&store)?;
+        Ok(count)
+    }
+
+    pub fn batch_delete(&self, ids: &[String]) -> Result<usize, String> {
+        let mut store = self.load()?;
+        let before = store.accounts.len();
+        store.accounts.retain(|a| !ids.iter().any(|id| id == &a.id));
+        let deleted = before.saturating_sub(store.accounts.len());
+        self.save(&store)?;
+        Ok(deleted)
+    }
+
+    pub fn export_json(&self, ids: Option<&[String]>) -> Result<String, String> {
+        let store = self.load()?;
+        let selected: Vec<Value> = store
+            .accounts
+            .iter()
+            .filter(|a| ids.is_none_or(|list| list.iter().any(|id| id == &a.id)))
+            .map(|a| {
+                let (access, refresh, exp) = token_info(&a.items).unwrap_or((String::new(), String::new(), None));
+                json!({
+                    "email": a.email,
+                    "name": a.name,
+                    "refresh_token": refresh,
+                    "access_token": a.access_token.clone().unwrap_or(access),
+                    "expiry_timestamp": a.access_expires_at.or(exp),
+                    "project_id": a.project_id,
+                    "id_token": a.id_token,
+                    "tags": a.meta.tags,
+                    "note": a.meta.note,
+                    "added_at": a.added_at,
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&selected).map_err(|e| e.to_string())
+    }
+
+    pub fn count_cockpit_tools_in(&self, dirs: &[PathBuf]) -> usize {
+        let existing_emails: Vec<String> = self
+            .load()
+            .map(|s| s.accounts.into_iter().map(|a| a.email.to_lowercase()).collect())
+            .unwrap_or_default();
+        collect_cockpit_antigravity_entries(dirs)
+            .into_iter()
+            .filter(|e| {
+                e.email
+                    .as_ref()
+                    .is_none_or(|mail| !existing_emails.contains(&mail.to_lowercase()))
+            })
+            .count()
+    }
+
+    pub fn import_cockpit_tools_from(&self, dirs: &[PathBuf]) -> Result<TokenImport, String> {
+        self.import_cockpit_tools_with(dirs, &win_http::request, &|| oauth_clients().to_vec())
+    }
+
+    fn import_cockpit_tools_with(
+        &self,
+        dirs: &[PathBuf],
+        http: &HttpFn<'_>,
+        clients: &dyn Fn() -> Vec<(String, String)>,
+    ) -> Result<TokenImport, String> {
+        let entries = collect_cockpit_antigravity_entries(dirs);
+        if entries.is_empty() {
+            return Err("未在本机 Cockpit Tools 目录中找到可导入的 Antigravity 账号".into());
+        }
+        let mut result = TokenImport::default();
+        for entry in entries {
+            let label = entry.email.clone().unwrap_or_else(|| mask_token(&entry.refresh_token));
+            let outcome = match refresh(&entry.refresh_token, None, http, clients) {
+                Ok((client_id, access, expires_at)) => {
+                    self.add_parsed_entry(&client_id, &access, expires_at, None, &entry, http)
+                }
+                Err(err) if !err.contains("invalid_grant") && entry.email.is_some() => {
+                    // 无网络或离线导出测试时，只要 Cockpit 记录已含邮箱与 refresh_token 仍保留导入。
+                    let access = entry.access_token.clone().unwrap_or_default();
+                    let expires = entry.expiry_timestamp.unwrap_or_else(|| Utc::now().timestamp() + 3600);
+                    let client_id = clients().into_iter().next().map(|(id, _)| id).unwrap_or_default();
+                    self.add_parsed_entry(&client_id, &access, expires, None, &entry, http)
+                }
+                Err(err) => Err(err),
+            };
+            match outcome {
+                Ok(id) => result.ids.push(id),
+                Err(e) => result.failures.push(format!("{}：{}", label, e)),
+            }
+        }
+        Ok(result)
+    }
+
     pub fn refresh_quota(&self, id: &str) -> Result<(), String> {
         self.refresh_quota_with(id, &win_http::request, &|| oauth_clients().to_vec())
     }
@@ -289,25 +799,43 @@ impl AntigravityAccountManager {
         let store = self.load()?;
         let account = store.accounts.iter().find(|a| a.id == id).ok_or("账号不存在")?.clone();
         let mut updated = account.clone();
-        let result = (|| -> Result<Quota, String> {
-            let token = match (&account.access_token, account.access_expires_at) {
-                (Some(t), Some(exp)) if exp - 60 > Utc::now().timestamp() => t.clone(),
-                _ => {
-                    let (_, refresh_token, _) = token_info(&account.items).ok_or("账号里没有 token，请在「添加账号」里重新授权这个账号")?;
-                    let (client_id, access, expires_at) = refresh(&refresh_token, account.client_id.as_deref(), http, clients)?;
-                    updated.client_id = Some(client_id);
-                    updated.access_token = Some(access.clone());
-                    updated.access_expires_at = Some(expires_at);
-                    access
+        let outcome: Result<Quota, (String, Option<String>)> = (|| {
+            let mut force_refresh = false;
+            for attempt in 0..2 {
+                let token = match (&updated.access_token, updated.access_expires_at) {
+                    (Some(t), Some(exp)) if !force_refresh && exp - 60 > Utc::now().timestamp() => t.clone(),
+                    _ => {
+                        let (_, refresh_token, _) = token_info(&updated.items)
+                            .ok_or_else(|| ("账号里没有 token，请在「添加账号」里重新授权这个账号".to_string(), None))?;
+                        let (client_id, access, expires_at) =
+                            refresh(&refresh_token, updated.client_id.as_deref(), http, clients)
+                                .map_err(|e| (e, None))?;
+                        updated.client_id = Some(client_id);
+                        updated.access_token = Some(access.clone());
+                        updated.access_expires_at = Some(expires_at);
+                        access
+                    }
+                };
+                match load_code_assist(&token, http) {
+                    Ok((project, plan, credits)) => {
+                        if project.is_some() {
+                            updated.project_id = project.clone();
+                        }
+                        let mut quota = fetch_models(&token, project.or(updated.project_id.clone()), http)?;
+                        quota.plan_type = plan;
+                        if quota.credits_balance.is_none() {
+                            quota.credits_balance = credits;
+                        }
+                        return Ok(quota);
+                    }
+                    Err((msg, None)) if attempt == 0 && msg.starts_with("token 已失效") => {
+                        force_refresh = true;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
                 }
-            };
-            let (project, plan) = load_code_assist(&token, http)?;
-            if project.is_some() {
-                updated.project_id = project.clone();
             }
-            let mut quota = fetch_models(&token, project.or(account.project_id.clone()), http)?;
-            quota.plan_type = plan;
-            Ok(quota)
+            Err(("刷新额度失败，请重试".to_string(), None))
         })();
 
         let mut store = self.load()?;
@@ -316,9 +844,13 @@ impl AntigravityAccountManager {
         stored.access_token = updated.access_token;
         stored.access_expires_at = updated.access_expires_at;
         stored.project_id = updated.project_id;
-        stored.quota.record(&result);
+        let (record_res, v_url) = match &outcome {
+            Ok(q) => (Ok(q.clone()), None),
+            Err((msg, url)) => (Err(msg.clone()), url.clone()),
+        };
+        stored.quota.record_with_verification(&record_res, v_url);
         self.save(&store)?;
-        result.map(|_| ())
+        outcome.map(|_| ()).map_err(|(msg, _)| msg)
     }
 }
 
@@ -418,7 +950,7 @@ fn refresh(
 ) -> Result<(String, String, i64), String> {
     let mut candidates = clients();
     if candidates.is_empty() {
-        return Err("没有在已安装的 Antigravity 中找到 OAuth 参数，无法查询额度".into());
+        return Err("未找到可用的 Google OAuth 参数，请配置 oauth-clients.local.json 或安装 Antigravity 后重试".into());
     }
     if let Some(p) = preferred {
         candidates.sort_by_key(|(id, _)| id != p);
@@ -447,24 +979,121 @@ fn refresh(
     Err(format!("刷新 token 失败（{}），请在「添加账号」里重新授权这个账号", last))
 }
 
-fn cloud_code_post(path: &str, token: &str, body: &Value, http: &HttpFn<'_>) -> Result<Value, String> {
+fn parse_google_validation_error(body: &[u8]) -> (String, Option<String>) {
+    let fallback = account_store::error_code(body);
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return (fallback, None);
+    };
+    let err = v.get("error");
+    let details = err.and_then(|e| e.get("details")).and_then(Value::as_array);
+    let mut url: Option<String> = None;
+    let mut reason: Option<String> = None;
+    if let Some(arr) = details {
+        for d in arr {
+            let r = d.get("reason").and_then(Value::as_str);
+            if matches!(r, Some("VALIDATION_REQUIRED") | Some("SUBSCRIPTION_REQUIRED")) {
+                reason = r.map(str::to_string);
+                if let Some(meta) = d.get("metadata") {
+                    url = ["validation_url", "verification_url", "appeal_url"]
+                        .iter()
+                        .find_map(|k| meta.get(*k).and_then(Value::as_str))
+                        .map(str::to_string);
+                }
+                if url.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+    let message = err
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or(&fallback);
+    if url.is_some() || reason.as_deref() == Some("VALIDATION_REQUIRED") || message.contains("Verify your account") {
+        let friendly = if url.is_some() {
+            "Google 账号需要人机安全验证，请点击「去验证」完成后重新刷新额度".to_string()
+        } else {
+            format!("Google 账号受限（{}）", message)
+        };
+        return (friendly, url);
+    }
+    (fallback, None)
+}
+
+fn cloud_code_post(path: &str, token: &str, body: &Value, http: &HttpFn<'_>) -> Result<Value, (String, Option<String>)> {
     let bearer = format!("Bearer {}", token);
-    let body = body.to_string();
-    let response = http(
-        "POST",
-        &format!("{}/v1internal:{}", CLOUD_CODE, path),
-        &[("Authorization", bearer.as_str()), ("Content-Type", "application/json"), ("Accept", "application/json"), ("User-Agent", USER_AGENT)],
-        Some(body.as_bytes()),
-    )?;
-    match response.status {
-        200..=299 => serde_json::from_slice(&response.body).map_err(|_| format!("{} 返回的不是 JSON", path)),
-        401 => Err("token 已失效，请在「添加账号」里重新授权这个账号".into()),
-        status => Err(format!("{} 返回 HTTP {} {}", path, status, account_store::error_code(&response.body))),
+    let body_str = body.to_string();
+    let headers = [
+        ("Authorization", bearer.as_str()),
+        ("Content-Type", "application/json"),
+        ("Accept", "application/json"),
+        ("User-Agent", USER_AGENT),
+    ];
+    let mut last_err: Option<(String, Option<String>)> = None;
+    for (idx, base) in CLOUD_CODE_ENDPOINTS.iter().enumerate() {
+        let url = format!("{}/v1internal:{}", base, path);
+        let response = match http("POST", &url, &headers, Some(body_str.as_bytes())) {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some((e, None));
+                continue;
+            }
+        };
+        match response.status {
+            200..=299 => {
+                return serde_json::from_slice(&response.body)
+                    .map_err(|_| (format!("{} 返回的不是 JSON", path), None));
+            }
+            401 => return Err(("token 已失效，请在「添加账号」里重新授权这个账号".into(), None)),
+            429 | 500..=599 if idx + 1 < CLOUD_CODE_ENDPOINTS.len() => {
+                let (code, v_url) = parse_google_validation_error(&response.body);
+                last_err = Some((format!("{} 返回 HTTP {} {}", path, response.status, code), v_url));
+                continue;
+            }
+            status => {
+                let (code, v_url) = parse_google_validation_error(&response.body);
+                let msg = if v_url.is_some() {
+                    code
+                } else {
+                    format!("{} 返回 HTTP {} {}", path, status, code)
+                };
+                return Err((msg, v_url));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| (format!("{} 请求失败", path), None)))
+}
+
+fn extract_credits(v: &Value) -> Option<String> {
+    let arr = v
+        .get("availableCredits")
+        .or_else(|| v.get("available_credits"))
+        .and_then(Value::as_array)?;
+    let mut total: f64 = 0.0;
+    let mut count = 0usize;
+    for item in arr {
+        let amt = item
+            .get("creditAmount")
+            .or_else(|| item.get("credit_amount"))
+            .or_else(|| item.get("amount"));
+        let val = amt.and_then(|x| x.as_f64().or_else(|| x.as_str()?.parse::<f64>().ok()));
+        if let Some(n) = val {
+            total += n;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    if (total.fract()).abs() < 1e-6 {
+        Some(format!("{} credits", total.round() as i64))
+    } else {
+        Some(format!("{:.2} credits", total))
     }
 }
 
-/// 返回 `(项目 id, 套餐名)`。
-fn load_code_assist(token: &str, http: &HttpFn<'_>) -> Result<(Option<String>, Option<String>), String> {
+/// 返回 `(项目 id, 套餐名, credits)`。
+fn load_code_assist(token: &str, http: &HttpFn<'_>) -> Result<(Option<String>, Option<String>, Option<String>), (String, Option<String>)> {
     let body = json!({
         "metadata": { "ideName": "antigravity", "ideType": "ANTIGRAVITY", "platform": "WINDOWS_AMD64", "pluginType": "GEMINI" },
         "mode": "FULL_ELIGIBILITY_CHECK",
@@ -476,10 +1105,11 @@ fn load_code_assist(token: &str, http: &HttpFn<'_>) -> Result<(Option<String>, O
         None => None,
     };
     let tier = |k: &str| v.get(k).and_then(|t| t.get("name").or_else(|| t.get("id"))).and_then(Value::as_str).map(str::to_string);
-    Ok((project, tier("paidTier").or_else(|| tier("currentTier"))))
+    let credits = extract_credits(&v);
+    Ok((project, tier("paidTier").or_else(|| tier("currentTier")), credits))
 }
 
-fn fetch_models(token: &str, project: Option<String>, http: &HttpFn<'_>) -> Result<Quota, String> {
+fn fetch_models(token: &str, project: Option<String>, http: &HttpFn<'_>) -> Result<Quota, (String, Option<String>)> {
     let body = match project.filter(|p| !p.is_empty()) {
         Some(p) => json!({ "project": p }),
         None => json!({}),
@@ -511,10 +1141,14 @@ fn parse_models(v: &Value) -> Quota {
         }
     }
     windows.sort_by(|a, b| a.label.cmp(&b.label));
-    Quota { plan_type: None, windows, credits_balance: None }
+    Quota {
+        plan_type: None,
+        windows,
+        credits_balance: extract_credits(v),
+    }
 }
 
-/// 已安装的 Antigravity `language_server.exe` 里的 OAuth client（id 与 secret 的所有组合），只读取一次。
+/// Google OAuth client 列表：保留本机客户端中的参数，并追加不随源码上传的本地配置。
 fn oauth_clients() -> &'static [(String, String)] {
     static CLIENTS: OnceLock<Vec<(String, String)>> = OnceLock::new();
     CLIENTS.get_or_init(|| {
@@ -542,6 +1176,11 @@ fn oauth_clients() -> &'static [(String, String)] {
                 break;
             }
         }
+        if let Some(configured) = super::oauth_client_config::configured_client() {
+            if !out.contains(&configured) {
+                out.push(configured);
+            }
+        }
         out
     })
 }
@@ -555,6 +1194,7 @@ fn view(a: &StoredAccount, is_current: bool) -> AccountView {
         is_current,
         access_expires_at: token_info(&a.items)
             .and_then(|(_, _, exp)| exp)
+            .or(a.access_expires_at)
             .and_then(|t| Utc.timestamp_opt(t, 0).single())
             .map(|t| t.to_rfc3339()),
         added_at: a.added_at.clone(),
@@ -563,6 +1203,7 @@ fn view(a: &StoredAccount, is_current: bool) -> AccountView {
         ..Default::default()
     }
     .with_quota(&a.quota)
+    .with_meta(&a.meta)
 }
 
 // ---------------------------------------------------------------------------
@@ -603,13 +1244,42 @@ impl AntigravityAccountManager {
     /// 在浏览器里用 Google 账号授权并保存为账号，不影响 Antigravity 当前的登录。返回账号 id。
     /// `on_url` 收到授权链接（浏览器没自动打开时可手动打开）；`cancelled` 为真时放弃等待。
     pub fn login_in_browser(&self, on_url: &dyn Fn(&str), cancelled: &dyn Fn() -> bool) -> Result<String, String> {
-        self.login_in_browser_with(on_url, cancelled, &win_http::request, &|| oauth_clients().to_vec(), &open_in_browser)
+        self.login_in_browser_with_manual(on_url, cancelled, &|| None)
     }
 
+    pub fn login_in_browser_with_manual(
+        &self,
+        on_url: &dyn Fn(&str),
+        cancelled: &dyn Fn() -> bool,
+        take_manual: &dyn Fn() -> Option<String>,
+    ) -> Result<String, String> {
+        self.login_in_browser_with_full(
+            on_url,
+            cancelled,
+            take_manual,
+            &win_http::request,
+            &|| oauth_clients().to_vec(),
+            &open_in_browser,
+        )
+    }
+
+    #[cfg(test)]
     fn login_in_browser_with(
         &self,
         on_url: &dyn Fn(&str),
         cancelled: &dyn Fn() -> bool,
+        http: &HttpFn<'_>,
+        clients: &dyn Fn() -> Vec<(String, String)>,
+        open: &dyn Fn(&str),
+    ) -> Result<String, String> {
+        self.login_in_browser_with_full(on_url, cancelled, &|| None, http, clients, open)
+    }
+
+    fn login_in_browser_with_full(
+        &self,
+        on_url: &dyn Fn(&str),
+        cancelled: &dyn Fn() -> bool,
+        take_manual: &dyn Fn() -> Option<String>,
         http: &HttpFn<'_>,
         clients: &dyn Fn() -> Vec<(String, String)>,
         open: &dyn Fn(&str),
@@ -620,8 +1290,7 @@ impl AntigravityAccountManager {
         let redirect = format!("http://127.0.0.1:{}{}", port, CALLBACK_PATH);
         let state = uuid::Uuid::new_v4().simple().to_string();
         // PKCE：即使授权码被截获，没有 verifier 也换不到 token。
-        let verifier = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
-        let challenge = base64_url(&Sha256::digest(verifier.as_bytes()));
+        let (verifier, challenge) = account_store::pkce_pair();
         let url = format!(
             "{}?{}",
             AUTH_URL,
@@ -640,7 +1309,7 @@ impl AntigravityAccountManager {
         );
         on_url(&url);
         open(&url);
-        let code = wait_for_code(&listener, &state, cancelled)?;
+        let code = wait_for_code(&listener, &state, cancelled, take_manual)?;
         let body = account_store::form_encode(&[
             ("code", &code),
             ("client_id", &client_id),
@@ -659,25 +1328,30 @@ impl AntigravityAccountManager {
             .get("refresh_token")
             .and_then(Value::as_str)
             .ok_or("Google 没有返回 refresh token，请重新授权并勾选全部权限")?;
+        let id_token = v.get("id_token").and_then(Value::as_str);
         let expires_at = Utc::now().timestamp() + v.get("expires_in").and_then(Value::as_i64).unwrap_or(3600);
-        self.add_tokens(&client_id, access, refresh_token, expires_at, None, http)
+        let entry = ParsedTokenEntry {
+            refresh_token: refresh_token.to_string(),
+            ..Default::default()
+        };
+        self.add_parsed_entry(&client_id, access, expires_at, id_token, &entry, http)
     }
 
-    /// 导入 refresh token：每行一个，或账号 JSON（数组或单个对象，含 `refresh_token` 和可选的 `email`）。
+    /// 导入 refresh token：每行一个，或账号 JSON（数组、单个对象或 Cockpit Tools 导出格式）。
     pub fn import_tokens(&self, text: &str) -> Result<TokenImport, String> {
         self.import_tokens_with(text, &win_http::request, &|| oauth_clients().to_vec())
     }
 
     fn import_tokens_with(&self, text: &str, http: &HttpFn<'_>, clients: &dyn Fn() -> Vec<(String, String)>) -> Result<TokenImport, String> {
-        let entries = parse_token_input(text);
+        let entries = parse_token_entries(text);
         if entries.is_empty() {
             return Err("没有找到 refresh token：请粘贴以 1// 开头的 token，或含 refresh_token 的账号 JSON".into());
         }
         let mut result = TokenImport::default();
-        for (refresh_token, email) in entries {
-            let label = email.clone().unwrap_or_else(|| mask_token(&refresh_token));
-            let outcome = refresh(&refresh_token, None, http, clients)
-                .and_then(|(client_id, access, expires_at)| self.add_tokens(&client_id, &access, &refresh_token, expires_at, email.as_deref(), http));
+        for entry in entries {
+            let label = entry.email.clone().unwrap_or_else(|| mask_token(&entry.refresh_token));
+            let outcome = refresh(&entry.refresh_token, None, http, clients)
+                .and_then(|(client_id, access, expires_at)| self.add_parsed_entry(&client_id, &access, expires_at, None, &entry, http));
             match outcome {
                 Ok(id) => result.ids.push(id),
                 Err(e) => result.failures.push(format!("{}：{}", label, e)),
@@ -691,10 +1365,14 @@ impl AntigravityAccountManager {
     fn login_client(&self, http: &HttpFn<'_>, clients: &dyn Fn() -> Vec<(String, String)>) -> Result<(String, String), String> {
         let candidates = clients();
         if candidates.is_empty() {
-            return Err("没有在已安装的 Antigravity 中找到 OAuth 参数，请先安装 Antigravity".into());
+            return Err("未找到可用的 Google OAuth 参数，请配置 oauth-clients.local.json 或安装 Antigravity 后重试".into());
         }
-        let used = self.load().ok().and_then(|s| s.accounts.iter().find_map(|a| a.client_id.clone()));
-        let live = self.read_live().ok().flatten().and_then(|items| token_info(&items)).map(|(_, refresh_token, _)| refresh_token);
+        let store = self.load().ok();
+        let used = store.as_ref().and_then(|s| s.accounts.iter().find_map(|a| a.client_id.clone()));
+        let live = store
+            .as_ref()
+            .and_then(|s| self.read_live_login(s).ok().flatten())
+            .map(|l| l.refresh_token);
         let preferred = used.or_else(|| live.and_then(|t| refresh(&t, None, http, clients).ok().map(|(id, _, _)| id)));
         let mut ordered = candidates.clone();
         if let Some(p) = &preferred {
@@ -709,49 +1387,92 @@ impl AntigravityAccountManager {
         Err("Antigravity 里找到的 OAuth 参数都没有通过 Google 校验，请更新 Antigravity 后重试".into())
     }
 
-    /// 用一组 token 新建账号，或更新同邮箱的账号；之后切换到它时按这组 token 合成登录项。
-    fn add_tokens(&self, client_id: &str, access: &str, refresh_token: &str, expires_at: i64, email_hint: Option<&str>, http: &HttpFn<'_>) -> Result<String, String> {
-        let bearer = format!("Bearer {}", access);
-        let profile = http("GET", USERINFO_URL, &[("Authorization", bearer.as_str()), ("Accept", "application/json")], None)
-            .ok()
-            .filter(|r| (200..300).contains(&r.status))
-            .and_then(|r| serde_json::from_slice::<Value>(&r.body).ok());
-        let email = profile
-            .as_ref()
-            .and_then(|p| p.get("email").and_then(Value::as_str))
-            .or(email_hint)
-            .map(str::trim)
-            .filter(|e| !e.is_empty())
-            .ok_or("无法确认这个 token 属于哪个 Google 账号，请在账号 JSON 里写上 email")?
-            .to_string();
-        let name = profile.as_ref().and_then(|p| p.get("name").and_then(Value::as_str)).map(str::to_string);
+    /// 用一组 token 新建账号，或更新同邮箱的账号；同时合并标签/备注/项目元数据。
+    fn add_parsed_entry(
+        &self,
+        client_id: &str,
+        access: &str,
+        expires_at: i64,
+        id_token: Option<&str>,
+        entry: &ParsedTokenEntry,
+        http: &HttpFn<'_>,
+    ) -> Result<String, String> {
+        let profile = if !access.is_empty() {
+            fetch_google_profile(access, http)
+        } else {
+            None
+        };
+        let (prof_email, prof_name) = profile.unwrap_or_else(|| (String::new(), None));
+        let email = if !prof_email.is_empty() {
+            prof_email
+        } else {
+            entry
+                .email
+                .as_deref()
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+                .ok_or("无法确认这个 token 属于哪个 Google 账号，请在账号 JSON 里写上 email")?
+                .to_string()
+        };
+        let name = prof_name.or_else(|| entry.name.clone());
+        let id_tok = id_token.map(str::to_string).or_else(|| entry.id_token.clone());
         let mut store = self.load()?;
         let id = match store.accounts.iter_mut().find(|a| a.email.eq_ignore_ascii_case(&email)) {
             Some(existing) => {
-                existing.items = synth_items(&email, name.as_deref().or(existing.name.as_deref()), access, refresh_token, expires_at, existing.project_id.as_deref());
+                if existing.project_id.is_none() && entry.project_id.is_some() {
+                    existing.project_id = entry.project_id.clone();
+                }
+                existing.items = synth_items(
+                    &email,
+                    name.as_deref().or(existing.name.as_deref()),
+                    access,
+                    &entry.refresh_token,
+                    expires_at,
+                    existing.project_id.as_deref(),
+                );
                 existing.synthetic = true;
                 if name.is_some() {
                     existing.name = name;
                 }
-                existing.client_id = Some(client_id.to_string());
-                existing.access_token = Some(access.to_string());
+                if !client_id.is_empty() {
+                    existing.client_id = Some(client_id.to_string());
+                }
+                existing.access_token = (!access.is_empty()).then(|| access.to_string());
                 existing.access_expires_at = Some(expires_at);
+                if id_tok.is_some() {
+                    existing.id_token = id_tok;
+                }
+                if !entry.meta.tags.is_empty() {
+                    existing.meta.add_tags(entry.meta.tags.iter().cloned());
+                }
+                if existing.meta.note.is_none() && entry.meta.note.is_some() {
+                    existing.meta.note = entry.meta.note.clone();
+                }
                 existing.id.clone()
             }
             None => {
                 let id = account_store::new_id();
                 store.accounts.push(StoredAccount {
+                    items: synth_items(
+                        &email,
+                        name.as_deref(),
+                        access,
+                        &entry.refresh_token,
+                        expires_at,
+                        entry.project_id.as_deref(),
+                    ),
                     id: id.clone(),
-                    items: synth_items(&email, name.as_deref(), access, refresh_token, expires_at, None),
                     email,
                     name,
                     synthetic: true,
-                    client_id: Some(client_id.to_string()),
-                    access_token: Some(access.to_string()),
+                    client_id: (!client_id.is_empty()).then(|| client_id.to_string()),
+                    access_token: (!access.is_empty()).then(|| access.to_string()),
                     access_expires_at: Some(expires_at),
-                    project_id: None,
+                    id_token: id_tok,
+                    project_id: entry.project_id.clone(),
                     added_at: account_store::now(),
                     last_used_at: None,
+                    meta: entry.meta.clone(),
                     quota: QuotaState::default(),
                 });
                 id
@@ -762,13 +1483,23 @@ impl AntigravityAccountManager {
     }
 }
 
-/// 等浏览器回到本机端口，取出授权码；其他请求（如 favicon）回 404 后继续等。
-fn wait_for_code(listener: &TcpListener, state: &str, cancelled: &dyn Fn() -> bool) -> Result<String, String> {
+/// 等浏览器回到本机端口（或用户在 UI 手动粘贴回调链接），取出授权码；其他请求（如 favicon）回 404 后继续等。
+fn wait_for_code(
+    listener: &TcpListener,
+    state: &str,
+    cancelled: &dyn Fn() -> bool,
+    take_manual: &dyn Fn() -> Option<String>,
+) -> Result<String, String> {
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let started = Instant::now();
     loop {
         if cancelled() {
             return Err("已取消登录".into());
+        }
+        if let Some(raw_manual) = take_manual() {
+            if let Some(code) = account_store::extract_callback_code(&raw_manual, Some(state))? {
+                return Ok(code);
+            }
         }
         if started.elapsed() > Duration::from_secs(LOGIN_TIMEOUT_SECS) {
             return Err("等待浏览器授权超时，请重试".into());
@@ -877,16 +1608,190 @@ fn client_pair_valid(client_id: &str, secret: &str, http: &HttpFn<'_>) -> bool {
         .unwrap_or(false)
 }
 
-/// 粘贴的内容里的 `(refresh_token, email)`：账号 JSON 优先，否则按 `1//…` 逐个取出。重复的只算一次。
-fn parse_token_input(text: &str) -> Vec<(String, Option<String>)> {
-    fn push(out: &mut Vec<(String, Option<String>)>, token: &str, email: Option<&str>) {
-        let token = token.trim();
-        if !token.is_empty() && !out.iter().any(|(t, _)| t == token) {
-            out.push((token.to_string(), email.map(str::trim).filter(|e| !e.is_empty()).map(str::to_string)));
+#[derive(Debug, Clone, Default)]
+struct ParsedTokenEntry {
+    refresh_token: String,
+    email: Option<String>,
+    name: Option<String>,
+    project_id: Option<String>,
+    id_token: Option<String>,
+    access_token: Option<String>,
+    expiry_timestamp: Option<i64>,
+    meta: AccountMeta,
+}
+
+fn fetch_google_profile(access_token: &str, http: &HttpFn<'_>) -> Option<(String, Option<String>)> {
+    let bearer = format!("Bearer {}", access_token);
+    let r = http("GET", USERINFO_URL, &[("Authorization", bearer.as_str()), ("Accept", "application/json")], None).ok()?;
+    if !(200..300).contains(&r.status) {
+        return None;
+    }
+    let v = serde_json::from_slice::<Value>(&r.body).ok()?;
+    let email = v.get("email").and_then(Value::as_str)?.trim().to_string();
+    if email.is_empty() {
+        return None;
+    }
+    let name = v.get("name").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    Some((email, name))
+}
+
+/// 构造 Antigravity 2.0 Windows 凭据管理器 / CLI token JSON，超过 2560 字节上限时裁剪 `id_token`。
+fn build_credential_payload(
+    access_token: &str,
+    refresh_token: &str,
+    expiry_ts: i64,
+    id_token: Option<&str>,
+) -> Result<String, String> {
+    let expiry_iso = Utc
+        .timestamp_opt(expiry_ts.max(0), 0)
+        .single()
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "token".into(),
+        json!({
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "refresh_token": refresh_token,
+            "expiry": expiry_iso,
+        }),
+    );
+    obj.insert("auth_method".into(), json!("consumer"));
+    if let Some(idt) = id_token.map(str::trim).filter(|s| !s.is_empty()) {
+        obj.insert("id_token".into(), json!(idt));
+    }
+    let text = serde_json::to_string(&Value::Object(obj.clone())).map_err(|e| e.to_string())?;
+    if text.len() <= CRED_MAX_BYTES {
+        return Ok(text);
+    }
+    obj.remove("id_token");
+    serde_json::to_string(&Value::Object(obj)).map_err(|e| e.to_string())
+}
+
+fn parse_v2_credential_json(raw: &str) -> Option<LiveLogin> {
+    let v: Value = serde_json::from_str(raw.trim()).ok()?;
+    let token_obj = v.get("token").unwrap_or(&v);
+    let refresh_token = ["refresh_token", "refreshToken"]
+        .iter()
+        .find_map(|k| token_obj.get(*k).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let access_token = ["access_token", "accessToken"]
+        .iter()
+        .find_map(|k| token_obj.get(*k).and_then(Value::as_str))
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    let expires_at = token_obj
+        .get("expiry")
+        .or_else(|| token_obj.get("expiry_timestamp"))
+        .and_then(|val| {
+            val.as_i64().or_else(|| {
+                val.as_str()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.timestamp()))
+            })
+        });
+    let id_token = v.get("id_token").and_then(Value::as_str).map(str::to_string);
+    let claims = id_token.as_deref().and_then(account_store::jwt_claims);
+    let email = claims
+        .as_ref()
+        .and_then(|c| c.get("email").and_then(Value::as_str))
+        .or_else(|| v.get("email").and_then(Value::as_str))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let name = claims
+        .as_ref()
+        .and_then(|c| c.get("name").and_then(Value::as_str))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Some(LiveLogin {
+        email,
+        name,
+        access_token,
+        refresh_token,
+        expires_at,
+        id_token,
+        db_items: None,
+    })
+}
+
+fn entry_from_json_value(item: &Value) -> Option<ParsedTokenEntry> {
+    let token_obj = item.get("token");
+    let refresh_token = ["refresh_token", "refreshToken"]
+        .iter()
+        .find_map(|k| {
+            item.get(*k)
+                .or_else(|| token_obj.and_then(|t| t.get(*k)))
+        })
+        .and_then(Value::as_str)?
+        .trim()
+        .to_string();
+    if refresh_token.is_empty() {
+        return None;
+    }
+    let email = item
+        .get("email")
+        .or_else(|| token_obj.and_then(|t| t.get("email")))
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let project_id = item
+        .get("project_id")
+        .or_else(|| token_obj.and_then(|t| t.get("project_id")))
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let access_token = ["access_token", "accessToken"]
+        .iter()
+        .find_map(|k| {
+            item.get(*k)
+                .or_else(|| token_obj.and_then(|t| t.get(*k)))
+        })
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let expiry_timestamp = item
+        .get("expiry_timestamp")
+        .or_else(|| token_obj.and_then(|t| t.get("expiry_timestamp")))
+        .and_then(Value::as_i64);
+    let id_token = item.get("id_token").and_then(Value::as_str).map(str::to_string);
+    let tags = item
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let note = item.get("note").or_else(|| item.get("notes")).and_then(Value::as_str).map(str::to_string);
+    Some(ParsedTokenEntry {
+        refresh_token,
+        email,
+        name,
+        project_id,
+        id_token,
+        access_token,
+        expiry_timestamp,
+        meta: AccountMeta::normalized(tags, note),
+    })
+}
+
+fn parse_token_entries(text: &str) -> Vec<ParsedTokenEntry> {
+    fn push(out: &mut Vec<ParsedTokenEntry>, entry: ParsedTokenEntry) {
+        let token = entry.refresh_token.trim();
+        if !token.is_empty() && !out.iter().any(|e| e.refresh_token == token) {
+            out.push(entry);
         }
     }
-    let mut out: Vec<(String, Option<String>)> = Vec::new();
-    if let Ok(value) = serde_json::from_str::<Value>(text.trim()) {
+    let mut out: Vec<ParsedTokenEntry> = Vec::new();
+    if let Ok(value) = serde_json::from_str::<Value>(text.trim().trim_start_matches('\u{feff}')) {
         let items: Vec<&Value> = match &value {
             Value::Array(a) => a.iter().collect(),
             Value::Object(o) => match o.get("accounts") {
@@ -896,12 +1801,8 @@ fn parse_token_input(text: &str) -> Vec<(String, Option<String>)> {
             _ => Vec::new(),
         };
         for item in items {
-            let token = ["refresh_token", "refreshToken"]
-                .iter()
-                .find_map(|k| item.get(*k).or_else(|| item.get("token").and_then(|t| t.get(*k))))
-                .and_then(Value::as_str);
-            if let Some(token) = token {
-                push(&mut out, token, item.get("email").and_then(Value::as_str));
+            if let Some(entry) = entry_from_json_value(item) {
+                push(&mut out, entry);
             }
         }
         if !out.is_empty() {
@@ -910,9 +1811,100 @@ fn parse_token_input(text: &str) -> Vec<(String, Option<String>)> {
     }
     let pattern = regex::Regex::new(r"1//[0-9A-Za-z_\-]{20,}").unwrap();
     for m in pattern.find_iter(text) {
-        push(&mut out, m.as_str(), None);
+        push(
+            &mut out,
+            ParsedTokenEntry {
+                refresh_token: m.as_str().to_string(),
+                ..Default::default()
+            },
+        );
     }
     out
+}
+
+/// 扫描 `~/.cockpit_tools` 下的 Antigravity 账号文件（`accounts/*.json` 与 `accounts.json`）。
+fn collect_cockpit_antigravity_entries(dirs: &[PathBuf]) -> Vec<ParsedTokenEntry> {
+    let mut out: Vec<ParsedTokenEntry> = Vec::new();
+    let mut push_unique = |entry: ParsedTokenEntry| {
+        if let Some(existing) = out.iter_mut().find(|e| {
+            e.refresh_token == entry.refresh_token
+                || (e.email.is_some() && e.email.as_deref().map(|s| s.to_lowercase()) == entry.email.as_deref().map(|s| s.to_lowercase()))
+        }) {
+            if !entry.meta.tags.is_empty() {
+                existing.meta.add_tags(entry.meta.tags);
+            }
+            if existing.meta.note.is_none() {
+                existing.meta.note = entry.meta.note;
+            }
+            return;
+        }
+        out.push(entry);
+    };
+
+    for root in dirs {
+        if !root.is_dir() {
+            continue;
+        }
+        // 读取索引文件里的 tags/note 或内嵌账号。
+        let mut index_meta: HashMap<String, AccountMeta> = HashMap::new();
+        let index_path = root.join("accounts.json");
+        if let Ok(text) = std::fs::read_to_string(&index_path) {
+            if let Ok(v) = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')) {
+                if let Some(arr) = v.get("accounts").and_then(Value::as_array) {
+                    for item in arr {
+                        let tags = item
+                            .get("tags")
+                            .and_then(Value::as_array)
+                            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect::<Vec<_>>())
+                            .unwrap_or_default();
+                        let note = item.get("note").or_else(|| item.get("notes")).and_then(Value::as_str).map(str::to_string);
+                        let meta = AccountMeta::normalized(tags, note);
+                        if let Some(email) = item.get("email").and_then(Value::as_str) {
+                            index_meta.insert(email.to_lowercase(), meta.clone());
+                        }
+                        if let Some(mut entry) = entry_from_json_value(item) {
+                            if entry.meta.tags.is_empty() {
+                                entry.meta.tags = meta.tags;
+                            }
+                            if entry.meta.note.is_none() {
+                                entry.meta.note = meta.note;
+                            }
+                            push_unique(entry);
+                        }
+                    }
+                }
+            }
+        }
+        let accounts_dir = root.join("accounts");
+        if let Ok(rd) = std::fs::read_dir(&accounts_dir) {
+            for file in rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|ext| ext == "json")) {
+                let Ok(text) = std::fs::read_to_string(&file) else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')) else { continue };
+                let Some(mut entry) = entry_from_json_value(&v) else { continue };
+                if let Some(mail) = &entry.email {
+                    if let Some(m) = index_meta.get(&mail.to_lowercase()) {
+                        if entry.meta.tags.is_empty() {
+                            entry.meta.tags = m.tags.clone();
+                        }
+                        if entry.meta.note.is_none() {
+                            entry.meta.note = m.note.clone();
+                        }
+                    }
+                }
+                push_unique(entry);
+            }
+        }
+    }
+    out
+}
+
+/// 粘贴的内容里的 `(refresh_token, email)`：账号 JSON 优先，否则按 `1//…` 逐个取出。重复的只算一次。
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_token_input(text: &str) -> Vec<(String, Option<String>)> {
+    parse_token_entries(text)
+        .into_iter()
+        .map(|e| (e.refresh_token, e.email))
+        .collect()
 }
 
 /// 报错时只露出 token 的开头，避免把整段 token 显示在界面上。
@@ -981,10 +1973,6 @@ fn pb_bytes(field: u32, data: &[u8], out: &mut Vec<u8>) {
     pb_varint(((field << 3) | 2) as u64, out);
     pb_varint(data.len() as u64, out);
     out.extend_from_slice(data);
-}
-
-fn base64_url(data: &[u8]) -> String {
-    account_store::base64_encode(data).trim_end_matches('=').replace('+', "-").replace('/', "_")
 }
 
 /// 用默认浏览器打开链接。
@@ -1271,6 +2259,140 @@ mod tests {
         let err = s.m.login_in_browser_with(&|_| {}, &|| true, &http, &clients, &|_| {}).unwrap_err();
         assert_eq!(err, "已取消登录");
     }
+
+    #[test]
+    fn antigravity_v2_credential_store_saves_switches_and_truncates_id_token() {
+        let root = std::env::temp_dir().join(format!("cv-ag-v2-{}", uuid::Uuid::new_v4()));
+        let gemini_home = root.join(".gemini");
+        fs::create_dir_all(gemini_home.join(CRED_FILE_CLI_DIR)).unwrap();
+
+        let cred_mem = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        struct MemCred(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+        impl CredStore for MemCred {
+            fn is_enabled(&self) -> bool { true }
+            fn read_secret(&self) -> Result<Option<String>, String> { Ok(self.0.lock().unwrap().clone()) }
+            fn write_secret(&self, payload: &str) -> Result<(), String> {
+                *self.0.lock().unwrap() = Some(payload.to_string());
+                Ok(())
+            }
+        }
+
+        // 构造含 email 的 JWT id_token，验证 >2560 字节时自动省略 id_token。
+        let big_claim = "x".repeat(2600);
+        let small_id_token = format!(
+            "eyJhbGciOiJub25lIn0.{}.sig",
+            account_store::base64_url_encode(br#"{"email":"v2a@gmail.com","name":"V2 User"}"#)
+        );
+        let big_id_token = format!(
+            "eyJhbGciOiJub25lIn0.{}.sig",
+            account_store::base64_url_encode(format!(r#"{{"email":"v2a@gmail.com","pad":"{}"}}"#, big_claim).as_bytes())
+        );
+        let future_exp = Utc::now().timestamp() + 3600;
+        let small_payload = build_credential_payload("ya29.v2a", "1//v2a", future_exp, Some(&small_id_token)).unwrap();
+        assert!(small_payload.len() <= CRED_MAX_BYTES && small_payload.contains("id_token"));
+        let trimmed_payload = build_credential_payload("ya29.v2a", "1//v2a", future_exp, Some(&big_id_token)).unwrap();
+        assert!(trimmed_payload.len() <= CRED_MAX_BYTES && !trimmed_payload.contains("id_token"));
+
+        *cred_mem.lock().unwrap() = Some(small_payload);
+        let m = AntigravityAccountManager::new_with_cred_store(
+            &root.join("missing.vscdb"),
+            &root.join("data"),
+            &root.join("backups"),
+            Some(gemini_home.clone()),
+            Box::new(MemCred(cred_mem.clone())),
+        );
+        let st = m.state().unwrap();
+        assert_eq!(st.current.as_ref().and_then(|c| c.email.as_deref()), Some("v2a@gmail.com"));
+        assert!(st.current_note.is_none());
+
+        let id_a = m.save_current().unwrap();
+        // 再登录另一个 2.0 账号，切换到 a 时同时写 Windows 凭据与两个 ~/.gemini 文件。
+        let b_id_token = format!(
+            "eyJhbGciOiJub25lIn0.{}.sig",
+            account_store::base64_url_encode(br#"{"email":"v2b@gmail.com","name":"V2 B"}"#)
+        );
+        *cred_mem.lock().unwrap() = Some(build_credential_payload("ya29.v2b", "1//v2b", future_exp, Some(&b_id_token)).unwrap());
+        let id_b = m.save_current().unwrap();
+        assert_ne!(id_a, id_b);
+
+        m.switch(&id_a).unwrap();
+        let active_raw = cred_mem.lock().unwrap().clone().unwrap();
+        assert!(active_raw.contains("1//v2a"));
+        assert!(fs::read_to_string(gemini_home.join(CRED_FILE_PRIMARY)).unwrap().contains("1//v2a"));
+        assert!(fs::read_to_string(gemini_home.join(CRED_FILE_CLI_DIR).join(CRED_FILE_CLI_TOKEN)).unwrap().contains("1//v2a"));
+        assert!(m.state().unwrap().accounts.iter().find(|a| a.id == id_a).unwrap().is_current);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn imports_cockpit_tools_with_tags_notes_batch_ops_and_validation_url() {
+        let s = Sandbox::new();
+        let cockpit = s.root.join(".cockpit_tools");
+        fs::create_dir_all(cockpit.join("accounts")).unwrap();
+        fs::write(
+            cockpit.join("accounts.json"),
+            r#"{"accounts":[{"email":"cockpit@gmail.com","tags":["主力","Google Pro"],"note":"来自 Cockpit"}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            cockpit.join("accounts").join("acc1.json"),
+            r#"{"email":"cockpit@gmail.com","name":"Cockpit User","token":{"refresh_token":"1//good-cockpit-token-012345","access_token":"ya29.cached","project_id":"proj-c"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(s.m.count_cockpit_tools_in(&[cockpit.clone()]), 1);
+        let calls = RefCell::new(Vec::new());
+        let http = fake_google("cockpit@gmail.com", &calls);
+        let imported = s.m.import_cockpit_tools_with(&[cockpit.clone()], &http, &clients).unwrap();
+        assert_eq!(imported.ids.len(), 1);
+        assert_eq!(s.m.count_cockpit_tools_in(&[cockpit]), 0);
+
+        let id = imported.ids[0].clone();
+        let acc = s.m.state().unwrap().accounts.into_iter().next().unwrap();
+        assert_eq!(acc.tags, vec!["主力", "Google Pro"]);
+        assert_eq!(acc.note.as_deref(), Some("来自 Cockpit"));
+
+        s.m.update_meta(&id, Some(vec!["已验证".into()]), Some(Some("更新备注".into()))).unwrap();
+        s.m.batch_update_tags(&[id.clone()], &["备用".into()], &["已验证".into()]).unwrap();
+        let exported = s.m.export_json(Some(&[id.clone()])).unwrap();
+        assert!(exported.contains("cockpit@gmail.com") && exported.contains("备用") && exported.contains("更新备注"));
+
+        // 模拟 Cloud Code 返回 VALIDATION_REQUIRED，记录 verification_url。
+        let verify_http = |method: &str, url: &str, _headers: &[(&str, &str)], _body: Option<&[u8]>| {
+            if url == TOKEN_URL {
+                return Ok(win_http::HttpResponse { status: 200, body: br#"{"access_token":"ya29.v","expires_in":3600}"#.to_vec() });
+            }
+            if method == "POST" && url.contains("loadCodeAssist") {
+                return Ok(win_http::HttpResponse {
+                    status: 403,
+                    body: br#"{"error":{"code":403,"message":"Verify your account","details":[{"reason":"VALIDATION_REQUIRED","metadata":{"validation_url":"https://accounts.google.com/verify?t=1"}}]}}"#.to_vec(),
+                });
+            }
+            Ok(win_http::HttpResponse { status: 200, body: b"{}".to_vec() })
+        };
+        assert!(s.m.refresh_quota_with(&id, &verify_http, &clients).is_err());
+        let acc = s.m.state().unwrap().accounts.into_iter().next().unwrap();
+        assert_eq!(acc.verification_url.as_deref(), Some("https://accounts.google.com/verify?t=1"));
+
+        // 手动粘贴回调 URL 完成浏览器登录（使用不同邮箱以免与已导入账号合并）。
+        let manual_given = std::sync::Mutex::new(Some(String::new()));
+        let shown = RefCell::new(String::new());
+        let http_manual = fake_google("manual@gmail.com", &calls);
+        let manual_id = s.m.login_in_browser_with_full(
+            &|url| {
+                let query = url.split_once('?').unwrap().1;
+                let state = query.split('&').find_map(|p| p.strip_prefix("state=")).unwrap();
+                *manual_given.lock().unwrap() = Some(format!("http://127.0.0.1:9999/oauth-callback?code=the-code&state={}", state));
+                *shown.borrow_mut() = url.to_string();
+            },
+            &|| false,
+            &|| manual_given.lock().unwrap().take().filter(|s| !s.is_empty()),
+            &http_manual,
+            &clients,
+            &|_| {},
+        ).unwrap();
+        assert_eq!(s.m.batch_delete(&[id, manual_id]).unwrap(), 2);
+    }
 }
 
 #[cfg(test)]
@@ -1282,7 +2404,7 @@ mod local_install {
         let db = super::default_state_db();
         let tmp = std::env::temp_dir().join(format!("cv-ag-check-{}", uuid::Uuid::new_v4()));
         let m = super::AntigravityAccountManager::new(&db, &tmp, &tmp);
-        let items = m.read_live().unwrap().expect("没有 Antigravity 登录");
+        let items = m.read_live_db().unwrap().expect("没有 Antigravity 登录");
         let (access, refresh, exp) = super::token_info(&items).expect("解析 oauthToken 失败");
         println!("live token: access {} chars, refresh {} chars, expiry {:?}", access.len(), refresh.len(), exp);
         println!("oauth clients found: {}", super::oauth_clients().len());

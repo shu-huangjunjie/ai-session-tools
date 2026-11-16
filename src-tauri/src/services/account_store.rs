@@ -45,6 +45,74 @@ pub struct Quota {
     pub credits_balance: Option<String>,
 }
 
+/// 账号上的标签与备注元数据（按账号持久化，导出与 Cockpit 互通时保留）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountMeta {
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+pub fn normalize_tags(tags: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in tags {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|existing| existing.eq_ignore_ascii_case(trimmed)) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+pub fn normalize_note(note: Option<String>) -> Option<String> {
+    note.and_then(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+impl AccountMeta {
+    pub fn normalized(tags: impl IntoIterator<Item = String>, note: Option<String>) -> Self {
+        Self {
+            tags: normalize_tags(tags),
+            note: normalize_note(note),
+        }
+    }
+
+    pub fn update(&mut self, tags: Option<Vec<String>>, note: Option<Option<String>>) {
+        if let Some(t) = tags {
+            self.tags = normalize_tags(t);
+        }
+        if let Some(n) = note {
+            self.note = normalize_note(n);
+        }
+    }
+
+    pub fn add_tags(&mut self, tags: impl IntoIterator<Item = String>) {
+        let mut combined = std::mem::take(&mut self.tags);
+        combined.extend(tags);
+        self.tags = normalize_tags(combined);
+    }
+
+    pub fn remove_tags(&mut self, tags: &[String]) {
+        let targets: Vec<String> = tags
+            .iter()
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        self.tags
+            .retain(|existing| !targets.iter().any(|target| existing.eq_ignore_ascii_case(target)));
+    }
+}
+
 /// 保存在账号上的最近一次额度查询结果。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QuotaState {
@@ -54,16 +122,30 @@ pub struct QuotaState {
     pub quota_error: Option<String>,
     #[serde(default)]
     pub quota_updated_at: Option<String>,
+    #[serde(default)]
+    pub verification_url: Option<String>,
 }
 
 impl QuotaState {
     pub fn record(&mut self, result: &Result<Quota, String>) {
+        self.record_with_verification(result, None);
+    }
+
+    pub fn record_with_verification(
+        &mut self,
+        result: &Result<Quota, String>,
+        verification_url: Option<String>,
+    ) {
         match result {
             Ok(quota) => {
                 self.quota = Some(quota.clone());
                 self.quota_error = None;
+                self.verification_url = None;
             }
-            Err(message) => self.quota_error = Some(message.clone()),
+            Err(message) => {
+                self.quota_error = Some(message.clone());
+                self.verification_url = verification_url.or_else(|| self.verification_url.take());
+            }
         }
         self.quota_updated_at = Some(Utc::now().to_rfc3339());
     }
@@ -73,7 +155,7 @@ impl QuotaState {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AccountView {
     pub id: String,
-    /// Claude：`oauth`（官方登录）或 `provider`（中转供应商）；其他客户端为空。
+    /// Claude/Codex：`oauth`（官方登录）或 `provider`（中转供应商）；Antigravity 为空。
     pub kind: Option<String>,
     pub email: Option<String>,
     pub name: Option<String>,
@@ -91,6 +173,15 @@ pub struct AccountView {
     pub quota: Option<Quota>,
     pub quota_error: Option<String>,
     pub quota_updated_at: Option<String>,
+    pub verification_url: Option<String>,
+    pub tags: Vec<String>,
+    pub note: Option<String>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub auth_field: Option<String>,
+    pub haiku_model: Option<String>,
+    pub sonnet_model: Option<String>,
+    pub opus_model: Option<String>,
 }
 
 impl AccountView {
@@ -98,6 +189,13 @@ impl AccountView {
         self.quota = state.quota.clone();
         self.quota_error = state.quota_error.clone();
         self.quota_updated_at = state.quota_updated_at.clone();
+        self.verification_url = state.verification_url.clone();
+        self
+    }
+
+    pub fn with_meta(mut self, meta: &AccountMeta) -> Self {
+        self.tags = meta.tags.clone();
+        self.note = meta.note.clone();
         self
     }
 }
@@ -122,6 +220,8 @@ pub struct AccountsState {
     /// 其他提示（如中转供应商盖过了官方登录）。
     pub notes: Vec<String>,
     pub accounts: Vec<AccountView>,
+    pub cockpit_import_count: usize,
+    pub cc_switch_available: bool,
 }
 
 pub fn now() -> String {
@@ -280,6 +380,151 @@ pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// URL 安全 Base64 编码（无填充），适用于 PKCE / JWT / OAuth state。
+pub fn base64_url_encode(data: &[u8]) -> String {
+    base64_encode(data)
+        .trim_end_matches('=')
+        .replace('+', "-")
+        .replace('/', "_")
+}
+
+/// 生成 PKCE `(verifier, challenge)`（S256）。
+pub fn pkce_pair() -> (String, String) {
+    use sha2::{Digest, Sha256};
+    let verifier = format!(
+        "{}{}",
+        base64_url_encode(uuid::Uuid::new_v4().as_bytes()),
+        base64_url_encode(uuid::Uuid::new_v4().as_bytes()),
+    );
+    let challenge = base64_url_encode(&Sha256::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
+/// 解析 URL 百分号编码（`%XX`）。
+pub fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// 从完整回调 URL、`code#state` 或 query 参数中提取 OAuth `code`。
+pub fn extract_callback_code(raw: &str, expected_state: Option<&str>) -> Result<Option<String>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if !trimmed.contains("://") && !trimmed.contains('?') && !trimmed.contains("code=") {
+        if let Some((code, state)) = trimmed.split_once('#') {
+            if let Some(exp) = expected_state {
+                if !state.is_empty() && state != exp {
+                    return Err("回调 state 不匹配，请重新发起授权".into());
+                }
+            }
+            let code = percent_decode(code.trim());
+            return Ok((!code.is_empty()).then_some(code));
+        }
+    }
+    let query = trimmed
+        .split_once('?')
+        .map(|(_, q)| q)
+        .unwrap_or(trimmed)
+        .split('#')
+        .next()
+        .unwrap_or("");
+    let mut code = None;
+    let mut state = None;
+    let mut err = None;
+    let mut err_desc = None;
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        if let Some((k, v)) = pair.split_once('=') {
+            let val = percent_decode(v);
+            match k {
+                "code" => code = Some(val),
+                "state" => state = Some(val),
+                "error" => err = Some(val),
+                "error_description" => err_desc = Some(val),
+                _ => {}
+            }
+        }
+    }
+    if let Some(e) = err {
+        let msg = err_desc.unwrap_or(e);
+        return Err(format!("授权失败：{}", msg));
+    }
+    if let (Some(exp), Some(got)) = (expected_state, state.as_deref()) {
+        if !got.is_empty() && got != exp {
+            return Err("回调 state 不匹配，请重新发起授权".into());
+        }
+    }
+    Ok(code.filter(|c| !c.is_empty()))
+}
+
+/// OAuth 本机回调成功/失败展示页。
+pub fn oauth_callback_page(title: &str, message: &str) -> String {
+    let escape = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>{t}</title>\
+         <body style=\"font-family:'Microsoft YaHei UI','Segoe UI',sans-serif;background:#f5f5f7;display:grid;place-items:center;height:100vh;margin:0\">\
+         <div style=\"background:#fff;padding:32px 40px;border-radius:16px;box-shadow:0 8px 30px rgba(0,0,0,.08);text-align:center\">\
+         <h2 style=\"margin:0 0 8px\">{t}</h2><p style=\"margin:0;color:#6e6e73\">{m}</p></div></body>",
+        t = escape(title),
+        m = escape(message)
+    )
+}
+
+/// 用默认浏览器打开授权链接。
+pub fn open_in_browser(url: &str) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let _ = std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
+/// 返回 Cockpit Tools 账号数据目录候选列表（`~/.cockpit_tools` 等）。
+pub fn cockpit_data_dirs() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        out.push(home.join(".cockpit_tools"));
+    }
+    if let Some(data_dir) = dirs::data_dir() {
+        let p = data_dir.join(".cockpit_tools");
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
 /// 标准 base64 编码（带填充）。
 pub fn base64_encode(data: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -334,7 +579,47 @@ mod tests {
             assert_eq!(base64_decode(&base64_encode(data)).unwrap(), data);
         }
         assert_eq!(base64_encode(b"hi"), "aGk=");
+        assert_eq!(base64_url_encode(b"\xfb\xff\xef"), "-__v");
         assert_eq!(form_encode(&[("refresh_token", "1//a b+c"), ("x", "y")]), "refresh_token=1%2F%2Fa%20b%2Bc&x=y");
+    }
+
+    #[test]
+    fn account_meta_normalizes_tags_notes_and_verification() {
+        let mut meta = AccountMeta::normalized(
+            vec!["  work ".into(), "".into(), "WORK".into(), "pro".into()],
+            Some("  主力账号  ".into()),
+        );
+        assert_eq!(meta.tags, vec!["work", "pro"]);
+        assert_eq!(meta.note.as_deref(), Some("主力账号"));
+        meta.add_tags(vec!["Pro".into(), "backup".into()]);
+        assert_eq!(meta.tags, vec!["work", "pro", "backup"]);
+        meta.remove_tags(&["WORK".into()]);
+        assert_eq!(meta.tags, vec!["pro", "backup"]);
+        meta.update(None, Some(Some("   ".into())));
+        assert_eq!(meta.note, None);
+
+        let mut qs = QuotaState::default();
+        qs.record_with_verification(&Err("请完成验证".into()), Some("https://accounts.google.com/v".into()));
+        assert_eq!(qs.verification_url.as_deref(), Some("https://accounts.google.com/v"));
+        qs.record(&Ok(Quota::default()));
+        assert_eq!(qs.verification_url, None);
+        assert_eq!(qs.quota_error, None);
+    }
+
+    #[test]
+    fn extracts_oauth_callback_codes_and_pkce() {
+        let (v, c) = pkce_pair();
+        assert!(v.len() >= 43 && !v.contains('=') && !c.contains('='));
+        assert_eq!(
+            extract_callback_code("http://127.0.0.1:1455/auth/callback?code=abc%2F1&state=st1", Some("st1")).unwrap(),
+            Some("abc/1".into())
+        );
+        assert_eq!(
+            extract_callback_code("cl-code#st2", Some("st2")).unwrap(),
+            Some("cl-code".into())
+        );
+        assert!(extract_callback_code("http://localhost:1455/auth/callback?code=x&state=wrong", Some("st1")).is_err());
+        assert!(extract_callback_code("http://localhost/cb?error=access_denied", None).is_err());
     }
 
     #[test]

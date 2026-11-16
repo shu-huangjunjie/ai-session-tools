@@ -12,6 +12,7 @@ export interface ClaudeCandidate {
   last_modified_time: string;
   project_path?: string;
   exists_locally: boolean;
+  has_updates?: boolean;
   session_file_path: string;
   custom_title?: string;
 }

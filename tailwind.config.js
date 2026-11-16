@@ -4,6 +4,11 @@ export default {
   content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
   theme: {
     extend: {
+      // Tailwind v3 only ships opacity steps of 5; the UI uses values such as /98, /96,
+      // /88 or /12, which would otherwise be dropped and leave panels transparent.
+      opacity: Object.fromEntries(
+        Array.from({ length: 101 }, (_, i) => [String(i), String(i / 100)]),
+      ),
       colors: {
         vault: {
           bg: '#06101c',

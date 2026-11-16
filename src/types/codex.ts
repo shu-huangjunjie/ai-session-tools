@@ -28,6 +28,7 @@ export interface CodexThreadCandidate {
   rollout_path: string;
   project_path?: string;
   exists_locally: boolean;
+  has_updates?: boolean;
   model?: string;
   observed_providers: string[];
   updated_at: string;

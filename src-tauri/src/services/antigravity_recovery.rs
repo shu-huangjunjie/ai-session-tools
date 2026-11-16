@@ -33,6 +33,8 @@ pub struct AntigravityCandidate {
     pub project_path: Option<String>,
     pub status: String,
     pub exists_locally: bool,
+    #[serde(default)]
+    pub has_updates: bool,
     pub transcript_path: String,
     pub has_full_transcript: bool,
 }
@@ -144,8 +146,8 @@ impl<'a> AntigravityRecoveryService<'a> {
         let excluded_ids = repo
             .excluded_source_ids(Self::SOURCE_TYPE)
             .unwrap_or_default();
-        let imported_ids = repo
-            .imported_source_ids(Self::SOURCE_TYPE)
+        let imported_snapshots = repo
+            .imported_source_snapshots(Self::SOURCE_TYPE)
             .unwrap_or_default();
 
         let summaries_db_path = self.antigravity_home.join("conversation_summaries.db");
@@ -156,12 +158,29 @@ impl<'a> AntigravityRecoveryService<'a> {
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
             ) {
                 Ok(conn) => {
-                    let stmt = match conn.prepare(
+                    let has_agent_name = conn
+                        .prepare("PRAGMA table_info(conversation_summaries)")
+                        .and_then(|mut s| {
+                            let cols: Vec<String> = s
+                                .query_map([], |r| r.get::<_, String>(1))?
+                                .flatten()
+                                .collect();
+                            Ok(cols.iter().any(|c| c == "agent_name"))
+                        })
+                        .unwrap_or(false);
+                    let agent_col = if has_agent_name {
+                        "agent_name"
+                    } else {
+                        "'' AS agent_name"
+                    };
+                    let sql = format!(
                         "SELECT conversation_id, title, preview, step_count, last_modified_time,
-                                workspace_uris, status, nesting_depth, parent_conversation_id
+                                workspace_uris, status, nesting_depth, parent_conversation_id, {}
                          FROM conversation_summaries
                          ORDER BY last_modified_time DESC",
-                    ) {
+                        agent_col
+                    );
+                    let stmt = match conn.prepare(&sql) {
                         Ok(s) => Some(s),
                         Err(e) => {
                             warnings.push(format!("查询 Antigravity 会话汇总失败：{}", e));
@@ -194,6 +213,7 @@ impl<'a> AntigravityRecoveryService<'a> {
                                 text(6)?,
                                 int(7)?,
                                 text(8)?,
+                                text(9)?,
                             ))
                         });
 
@@ -208,10 +228,20 @@ impl<'a> AntigravityRecoveryService<'a> {
                                     workspace_uris_raw,
                                     status,
                                     nesting_depth,
-                                    _parent_id,
+                                    parent_id,
+                                    agent_name,
                                 ) = item;
 
-                                if nesting_depth > 0 || cid.is_empty() {
+                                if cid.is_empty() {
+                                    continue;
+                                }
+                                // Subagents belong to their parent conversation; mark them seen so
+                                // the brain/ directory fallback below does not import them either.
+                                if nesting_depth > 0
+                                    || !parent_id.trim().is_empty()
+                                    || !agent_name.trim().is_empty()
+                                {
+                                    seen_cids.insert(cid);
                                     continue;
                                 }
 
@@ -235,6 +265,7 @@ impl<'a> AntigravityRecoveryService<'a> {
                                 } else if regular_path.is_file() {
                                     (regular_path, false)
                                 } else {
+                                    seen_cids.insert(cid);
                                     continue;
                                 };
 
@@ -256,6 +287,20 @@ impl<'a> AntigravityRecoveryService<'a> {
                                     title.trim().to_string()
                                 };
 
+                                let exists_locally = imported_snapshots.contains_key(&cid);
+                                let has_updates = imported_snapshots
+                                    .get(&cid)
+                                    .map(|snap| {
+                                        let parsed = Self::parse_transcript(&chosen_transcript);
+                                        snap.has_message_or_path_updates(
+                                            Self::SOURCE_TYPE,
+                                            &cid,
+                                            &parsed,
+                                            project_path.as_deref(),
+                                        )
+                                    })
+                                    .unwrap_or(false);
+
                                 seen_cids.insert(cid.clone());
                                 candidates.push(AntigravityCandidate {
                                     conversation_id: cid.clone(),
@@ -265,7 +310,8 @@ impl<'a> AntigravityRecoveryService<'a> {
                                     last_modified_time: last_modified,
                                     project_path,
                                     status,
-                                    exists_locally: imported_ids.contains(&cid),
+                                    exists_locally,
+                                    has_updates,
                                     transcript_path: chosen_transcript
                                         .to_string_lossy()
                                         .to_string(),
@@ -320,8 +366,25 @@ impl<'a> AntigravityRecoveryService<'a> {
                         continue;
                     };
 
-                    let (title, preview, mod_time) =
-                        Self::quick_peek_transcript(&chosen_transcript);
+                    let Some((title, preview, mod_time)) =
+                        Self::quick_peek_transcript(&chosen_transcript)
+                    else {
+                        seen_cids.insert(cid);
+                        continue;
+                    };
+                    let exists_locally = imported_snapshots.contains_key(&cid);
+                    let has_updates = imported_snapshots
+                        .get(&cid)
+                        .map(|snap| {
+                            let parsed = Self::parse_transcript(&chosen_transcript);
+                            snap.has_message_or_path_updates(
+                                Self::SOURCE_TYPE,
+                                &cid,
+                                &parsed,
+                                None,
+                            )
+                        })
+                        .unwrap_or(false);
                     seen_cids.insert(cid.clone());
                     candidates.push(AntigravityCandidate {
                         conversation_id: cid.clone(),
@@ -331,7 +394,8 @@ impl<'a> AntigravityRecoveryService<'a> {
                         last_modified_time: mod_time,
                         project_path: None,
                         status: "DONE".to_string(),
-                        exists_locally: imported_ids.contains(&cid),
+                        exists_locally,
+                        has_updates,
                         transcript_path: chosen_transcript.to_string_lossy().to_string(),
                         has_full_transcript: has_full,
                     });
@@ -365,48 +429,55 @@ impl<'a> AntigravityRecoveryService<'a> {
             .unwrap_or(0)
     }
 
-    /// 快速探测日志文件提取首条用户消息作为标题与修改时间
-    fn quick_peek_transcript(path: &Path) -> (String, String, String) {
-        let file = match File::open(path) {
-            Ok(f) => f,
-            Err(_) => {
-                return (
-                    "Antigravity 会话".to_string(),
-                    String::new(),
-                    chrono::Utc::now().to_rfc3339(),
-                )
-            }
-        };
+    /// 快速探测日志文件提取首条用户消息作为标题与修改时间；
+    /// 若日志是无 `USER_INPUT` 的子代理轨迹（仅含 `SYSTEM_MESSAGE`），返回 `None`。
+    fn quick_peek_transcript(path: &Path) -> Option<(String, String, String)> {
+        let file = File::open(path).ok()?;
         let mod_time = std::fs::metadata(path)
             .and_then(|m| m.modified())
             .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
             .unwrap_or_else(|_| chrono::Utc::now().to_rfc3339());
 
         let reader = BufReader::new(file);
+        let mut saw_system_message = false;
+        let mut saw_any_message = false;
         for line_res in reader.lines() {
             if let Ok(line) = line_res {
                 if let Ok(item) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if item.get("type").and_then(|t| t.as_str()) == Some("USER_INPUT") {
-                        let raw = item.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                        let cleaned = Self::clean_user_input(raw);
-                        if !cleaned.is_empty() {
-                            let title = if cleaned.chars().count() > 40 {
-                                format!("{}...", cleaned.chars().take(40).collect::<String>())
-                            } else {
-                                cleaned.clone()
-                            };
-                            let preview = if cleaned.chars().count() > 100 {
-                                format!("{}...", cleaned.chars().take(100).collect::<String>())
-                            } else {
-                                cleaned
-                            };
-                            return (title, preview, mod_time);
+                    match item.get("type").and_then(|t| t.as_str()) {
+                        Some("USER_INPUT") => {
+                            saw_any_message = true;
+                            let raw = item.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                            let cleaned = Self::clean_user_input(raw);
+                            if !cleaned.is_empty() {
+                                let title = if cleaned.chars().count() > 40 {
+                                    format!("{}...", cleaned.chars().take(40).collect::<String>())
+                                } else {
+                                    cleaned.clone()
+                                };
+                                let preview = if cleaned.chars().count() > 100 {
+                                    format!("{}...", cleaned.chars().take(100).collect::<String>())
+                                } else {
+                                    cleaned
+                                };
+                                return Some((title, preview, mod_time));
+                            }
                         }
+                        Some("SYSTEM_MESSAGE") => {
+                            saw_system_message = true;
+                        }
+                        Some("PLANNER_RESPONSE") => {
+                            saw_any_message = true;
+                        }
+                        _ => {}
                     }
                 }
             }
         }
-        ("Antigravity 会话".to_string(), String::new(), mod_time)
+        if saw_system_message || !saw_any_message {
+            return None;
+        }
+        Some(("Antigravity 会话".to_string(), String::new(), mod_time))
     }
 
     /// 执行选定候选会话的恢复与导入
@@ -701,6 +772,7 @@ mod tests {
             project_path: Some("C:\\Projects\\Context restoration app".to_string()),
             status: "CASCADE_RUN_STATUS_IDLE".to_string(),
             exists_locally: false,
+            has_updates: false,
             transcript_path: transcript_path.to_string_lossy().to_string(),
             has_full_transcript: false,
         };

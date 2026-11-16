@@ -23,7 +23,7 @@ export function Segmented<K extends string>({ items, value, onChange, children }
   return (
     <div
       role="tablist"
-      className="flex items-center gap-0.5 p-[3px] rounded-[9px] bg-black/[0.05] dark:bg-white/[0.07] min-w-0 overflow-x-auto no-scrollbar"
+      className="flex items-center gap-0.5 p-[3px] rounded-xl bg-slate-200/60 dark:bg-[#0b101b]/85 border border-slate-200/80 dark:border-slate-800/90 shadow-[inset_0_1px_2px_rgba(15,23,42,0.04)] min-w-0 overflow-x-auto no-scrollbar"
     >
       {items.map((item) => {
         const active = item.key === value;
@@ -36,16 +36,32 @@ export function Segmented<K extends string>({ items, value, onChange, children }
             aria-label={item.ariaLabel}
             title={item.title}
             onClick={() => onChange(item.key)}
-            className={`flex items-center gap-1.5 px-3 py-[5px] rounded-[7px] text-xs whitespace-nowrap transition-all duration-150 ${
+            className={`flex items-center gap-1.5 px-3 py-[5px] rounded-[9px] text-xs whitespace-nowrap transition-all duration-150 ${
               active
-                ? 'bg-white dark:bg-[#2c2c2e] text-[#1d1d1f] dark:text-white font-semibold shadow-[0_1px_2px_rgba(0,0,0,0.1)]'
-                : 'text-[#6e6e73] dark:text-[#a1a1a6] hover:text-[#1d1d1f] dark:hover:text-white'
+                ? 'bg-white dark:bg-[#1e2940] text-slate-900 dark:text-white font-semibold shadow-[0_1px_3px_rgba(15,23,42,0.10)] ring-1 ring-slate-200/80 dark:ring-slate-700/80'
+                : 'text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200 hover:bg-white/60 dark:hover:bg-white/[0.04]'
             }`}
           >
-            {item.dot && <span className="w-[7px] h-[7px] rounded-full flex-shrink-0" style={{ background: item.dot }} />}
+            {item.dot && (
+              <span
+                className="w-[7px] h-[7px] rounded-full flex-shrink-0"
+                style={{
+                  background: item.dot,
+                  boxShadow: active ? `0 0 0 2px ${item.dot}26, 0 0 6px ${item.dot}66` : undefined,
+                }}
+              />
+            )}
             <span className="flex items-center gap-1 max-w-[200px] truncate">{item.label}</span>
             {item.count !== undefined && (
-              <span className="text-[11px] font-mono font-normal text-[#86868b]">{item.count}</span>
+              <span
+                className={`text-[10.5px] font-mono px-1.5 py-px rounded-md ${
+                  active
+                    ? 'bg-blue-50 dark:bg-blue-500/15 text-blue-600 dark:text-sky-300 font-medium'
+                    : 'bg-slate-200/75 dark:bg-slate-800/85 text-slate-500 dark:text-slate-400 font-normal'
+                }`}
+              >
+                {item.count}
+              </span>
             )}
           </button>
         );

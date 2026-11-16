@@ -1,6 +1,6 @@
 import React from 'react';
 
-export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'link';
+export type ButtonVariant = 'primary' | 'accent' | 'secondary' | 'ghost' | 'danger' | 'link';
 
 interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: ButtonVariant;
@@ -21,25 +21,27 @@ export const Button: React.FC<ButtonProps> = ({
   ...props
 }) => {
   const base =
-    'inline-flex items-center justify-center gap-1.5 font-medium rounded-lg whitespace-nowrap transition-colors duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#0071e3]/40 select-none disabled:opacity-40 disabled:cursor-not-allowed';
+    'inline-flex items-center justify-center gap-1.5 font-medium rounded-lg whitespace-nowrap transition-all duration-150 active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40 select-none disabled:opacity-45 disabled:cursor-not-allowed disabled:active:scale-100';
 
   const sizeClasses = {
-    sm: 'px-2.5 py-1 text-xs',
-    md: 'px-3 py-1.5 text-xs',
-    lg: 'px-4 py-2 text-sm',
+    sm: 'h-[30px] px-2.5 text-xs',
+    md: 'h-[34px] px-3 text-xs',
+    lg: 'h-9 px-4 text-sm',
   }[size];
 
   const variantClasses = {
     primary:
-      'bg-[#0071e3] hover:bg-[#0077ed] active:bg-[#0062c4] text-white border border-[#0071e3]',
+      'bg-gradient-to-b from-[#3b82f6] to-[#1d4ed8] hover:from-[#60a5fa] hover:to-[#2563eb] active:from-[#2563eb] active:to-[#1e40af] text-white border border-[#1d4ed8]/90 dark:border-blue-400/35 shadow-[0_2px_6px_rgba(37,99,235,0.28),inset_0_1px_0_rgba(255,255,255,0.2)]',
+    accent:
+      'bg-blue-50/90 dark:bg-blue-500/12 hover:bg-blue-100/85 dark:hover:bg-blue-500/20 active:bg-blue-200/60 dark:active:bg-blue-500/25 text-blue-700 dark:text-sky-300 border border-blue-200/85 dark:border-blue-400/30 shadow-[0_1px_2px_rgba(37,99,235,0.06)]',
     secondary:
-      'bg-white dark:bg-white/[0.06] hover:bg-[#f5f5f7] dark:hover:bg-white/[0.1] active:bg-black/[0.06] dark:active:bg-white/[0.14] text-[#1d1d1f] dark:text-[#f5f5f7] border border-black/[0.1] dark:border-white/[0.1]',
+      'bg-white/95 dark:bg-[#192338] hover:bg-slate-50 dark:hover:bg-[#212e47] active:bg-slate-100 dark:active:bg-[#273654] text-slate-700 dark:text-slate-200 border border-slate-200/90 dark:border-slate-700/75 shadow-[0_1px_2px_rgba(15,23,42,0.05),inset_0_1px_0_rgba(255,255,255,0.65)] dark:shadow-[0_1px_2px_rgba(0,0,0,0.25),inset_0_1px_0_rgba(255,255,255,0.04)]',
     ghost:
-      'bg-transparent hover:bg-black/[0.05] dark:hover:bg-white/[0.07] active:bg-black/[0.08] dark:active:bg-white/[0.12] text-[#6e6e73] dark:text-[#a1a1a6] hover:text-[#1d1d1f] dark:hover:text-[#f5f5f7] border border-transparent',
+      'bg-transparent hover:bg-slate-100/90 dark:hover:bg-slate-800/75 active:bg-slate-200/70 dark:active:bg-slate-800 text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 border border-transparent',
     danger:
-      'bg-[#ff3b30]/[0.05] dark:bg-[#ff453a]/10 hover:bg-[#ff3b30]/[0.11] dark:hover:bg-[#ff453a]/20 active:bg-[#ff3b30]/[0.16] text-[#d70015] dark:text-[#ff453a] border border-[#ff3b30]/25 dark:border-[#ff453a]/30',
+      'bg-rose-50/85 dark:bg-rose-500/10 hover:bg-rose-100/85 dark:hover:bg-rose-500/20 active:bg-rose-200/60 text-rose-600 dark:text-rose-400 border border-rose-200/85 dark:border-rose-500/30',
     link:
-      'bg-transparent text-[#0071e3] dark:text-[#2997ff] hover:text-[#0077ed] dark:hover:text-[#64b5ff] p-0 underline border-none active:scale-100',
+      'h-auto bg-transparent text-blue-600 dark:text-sky-400 hover:text-blue-700 dark:hover:text-sky-300 p-0 underline border-none',
   }[variant];
 
   return (

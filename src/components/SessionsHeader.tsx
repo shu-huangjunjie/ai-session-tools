@@ -18,7 +18,7 @@ import { useI18n } from '../i18n';
 export type SourceCategory = 'codex' | 'antigravity' | 'claude';
 
 const SOURCE_NAME: Record<SourceCategory, string> = { codex: 'Codex', antigravity: 'Antigravity', claude: 'Claude' };
-export const SOURCE_COLOR: Record<SourceCategory, string> = { codex: '#0071e3', antigravity: '#af52de', claude: '#d97706' };
+export const SOURCE_COLOR: Record<SourceCategory, string> = { codex: '#2563eb', antigravity: '#8b5cf6', claude: '#d97706' };
 
 interface SessionsHeaderProps {
   activeSource: SourceCategory;
@@ -109,7 +109,12 @@ export const SessionsHeader: React.FC<SessionsHeaderProps> = ({
       >
         {isScanning ? t.sidebar.scanning : t.sessions.scan}
       </Button>
-      <Button variant="primary" icon={publish.icon} onClick={onPublish} title={publish.tooltip}>
+      <Button
+        variant={selectionCount > 0 ? 'primary' : 'accent'}
+        icon={publish.icon}
+        onClick={onPublish}
+        title={publish.tooltip}
+      >
         {publish.label}
         {selectionCount > 0 && ` (${selectionCount})`}
       </Button>
@@ -121,7 +126,7 @@ export const SessionsHeader: React.FC<SessionsHeaderProps> = ({
       >
         {interpolate(t.header.openClient, { name })}
       </Button>
-      <div className="h-5 w-px bg-black/[0.08] dark:bg-white/[0.1] mx-1" />
+      <div className="h-4 w-px bg-slate-200 dark:bg-slate-700/80 mx-0.5" />
       <Button
         variant="danger"
         icon={<DatabaseZap size={13} />}

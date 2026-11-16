@@ -16,7 +16,9 @@ import {
   Conversation,
   ConversationSummary,
   FolderPin,
+  PrismOpenMode,
   ResetResult,
+  VaultFocusPayload,
 } from './types';
 import { NavRail, AppPage, APP_PAGES } from './components/NavRail';
 import { SessionsHeader } from './components/SessionsHeader';
@@ -31,6 +33,11 @@ import { ImportModal } from './components/ImportModal';
 import { SkillsManager } from './components/SkillsManager';
 import { McpManager } from './components/McpManager';
 import { AccountsManager } from './components/AccountsManager';
+import { QuickLaunchModal } from './components/QuickLaunch';
+import {
+  ConversationHandoffModal,
+  HandoffConversationTarget,
+} from './components/ConversationHandoffModal';
 
 import { Modal } from './components/common/Modal';
 import { Button } from './components/common/Button';
@@ -49,7 +56,8 @@ const safeFileName = (title: string) =>
 export const App: React.FC = () => {
   const { t, interpolate } = useI18n();
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
-    return (localStorage.getItem('cv_theme') as 'dark' | 'light') || 'dark';
+    const saved = localStorage.getItem('cv_theme_v2');
+    return saved === 'dark' || saved === 'light' ? saved : 'light';
   });
 
   useEffect(() => {
@@ -58,7 +66,7 @@ export const App: React.FC = () => {
     } else {
       document.documentElement.classList.remove('dark');
     }
-    localStorage.setItem('cv_theme', theme);
+    localStorage.setItem('cv_theme_v2', theme);
   }, [theme]);
 
   const toggleTheme = () => {
@@ -215,6 +223,8 @@ export const App: React.FC = () => {
   const [isPublishingClaude, setIsPublishingClaude] = useState(false);
 
   const [importModalOpen, setImportModalOpen] = useState(false);
+  const [quickLaunchOpen, setQuickLaunchOpen] = useState(false);
+  const [handoffConv, setHandoffConv] = useState<HandoffConversationTarget | null>(null);
 
   // Codex publish confirmation
   const [codexPublishDialog, setCodexPublishDialog] = useState<{
@@ -250,6 +260,8 @@ export const App: React.FC = () => {
     claudeModalOpen ||
     claudePublishModalOpen ||
     importModalOpen ||
+    quickLaunchOpen ||
+    handoffConv !== null ||
     renameDialog !== null ||
     deleteDialog !== null ||
     codexPublishDialog !== null ||
@@ -281,8 +293,11 @@ export const App: React.FC = () => {
   }, []);
 
   // Reload conversation list
+  const [detailRefreshSeq, setDetailRefreshSeq] = useState(0);
+  const loadedConversationIdRef = useRef<string | null>(null);
+
   const reloadConversations = useCallback(
-    async (selectIdAfter?: string, query?: string) => {
+    async (selectIdAfter?: string, query?: string, refreshMessages = false) => {
       const request = ++listRequest.current;
       try {
         let list: ConversationSummary[];
@@ -300,12 +315,28 @@ export const App: React.FC = () => {
         // Search results are a subset of the list, whose placements are already known.
         if (!currentQuery.trim()) refreshCodexVisibility();
 
-        const nextSelected = selectIdAfter || selectedId || (list.length > 0 ? list[0].id : null);
-        if (nextSelected && list.some((c) => c.id === nextSelected)) {
-          setSelectedId(nextSelected);
-        } else if (list.length > 0) {
-          setSelectedId(list[0].id);
+        const resolvedId =
+          selectIdAfter && list.some((c) => c.id === selectIdAfter)
+            ? selectIdAfter
+            : selectedId && list.some((c) => c.id === selectedId)
+            ? selectedId
+            : list.length > 0
+            ? list[0].id
+            : null;
+
+        if (resolvedId) {
+          const summary = list.find((c) => c.id === resolvedId);
+          if (summary) {
+            setActiveConversation((prev) =>
+              prev && prev.id === summary.id ? { ...prev, ...summary } : prev
+            );
+          }
+          setSelectedId(resolvedId);
+          if (refreshMessages && resolvedId === selectedId) {
+            setDetailRefreshSeq((n) => n + 1);
+          }
         } else {
+          loadedConversationIdRef.current = null;
           setSelectedId(null);
           setActiveConversation(null);
           setMessages([]);
@@ -345,20 +376,25 @@ export const App: React.FC = () => {
     }).catch((err) => addToast('error', `加载会话列表失败：${errorMessage(err)}`));
   }, []);
 
-  // Load message detail when selectedId changes
+  // Load message detail when selectedId changes or an incremental recovery refreshes it
   useEffect(() => {
     if (!selectedId) {
+      loadedConversationIdRef.current = null;
       setActiveConversation(null);
       setMessages([]);
       return;
     }
 
     let isCancelled = false;
-    setIsLoadingMessages(true);
+    const isSwitchingConversation = loadedConversationIdRef.current !== selectedId;
+    if (isSwitchingConversation) {
+      setIsLoadingMessages(true);
+    }
 
     Promise.all([api.getConversation(selectedId), api.getMessages(selectedId)])
       .then(([conv, msgs]) => {
         if (!isCancelled) {
+          loadedConversationIdRef.current = selectedId;
           setActiveConversation(conv);
           setMessages(msgs);
         }
@@ -369,7 +405,7 @@ export const App: React.FC = () => {
         }
       })
       .finally(() => {
-        if (!isCancelled) {
+        if (!isCancelled && isSwitchingConversation) {
           setIsLoadingMessages(false);
         }
       });
@@ -377,11 +413,20 @@ export const App: React.FC = () => {
     return () => {
       isCancelled = true;
     };
-  }, [selectedId]);
+  }, [selectedId, detailRefreshSeq]);
 
   // Global Keyboard Shortcuts: Ctrl+K to search, F2 for rename, Del for delete
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l') {
+        e.preventDefault();
+        if (quickLaunchOpen) {
+          setQuickLaunchOpen(false);
+        } else if (!anyDialogOpen) {
+          setQuickLaunchOpen(true);
+        }
+        return;
+      }
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         if (anyDialogOpen) return;
@@ -420,7 +465,7 @@ export const App: React.FC = () => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedId, activeConversation, anyDialogOpen, page]);
+  }, [selectedId, activeConversation, anyDialogOpen, page, quickLaunchOpen]);
 
   // Search input handler: wait for a pause in typing before querying the index.
   const searchTimer = useRef<ReturnType<typeof setTimeout>>();
@@ -467,6 +512,9 @@ export const App: React.FC = () => {
       const report = await api.scanCodex();
       setRecoveryReport(report);
       setRecoveryModalOpen(true);
+      if (conversations.length > 0) {
+        void reloadConversations();
+      }
     } catch (err) {
       addToast('error', `扫描 Codex 失败：${errorMessage(err)}`);
     } finally {
@@ -486,7 +534,7 @@ export const App: React.FC = () => {
         `恢复完成：新增 ${res.new_conversation_count} 个会话，写入 ${res.message_count} 条消息`
       );
       if (res.warnings.length > 0) addToast('warning', res.warnings.slice(0, 3).join('；'));
-      await reloadConversations();
+      await reloadConversations(undefined, undefined, true);
     } catch (err) {
       addToast('error', `恢复失败：${errorMessage(err)}`);
     } finally {
@@ -503,6 +551,9 @@ export const App: React.FC = () => {
       const report = await api.scanAntigravity();
       setAntigravityReport(report);
       setAntigravityModalOpen(true);
+      if (conversations.length > 0) {
+        void reloadConversations();
+      }
     } catch (err) {
       addToast('error', `扫描 Antigravity 失败：${errorMessage(err)}`);
     } finally {
@@ -522,7 +573,7 @@ export const App: React.FC = () => {
         `Antigravity 恢复完成：新增 ${res.new_conversation_count} 个会话，解析 ${res.message_count} 条消息`
       );
       if (res.warnings.length > 0) addToast('warning', res.warnings.slice(0, 3).join('；'));
-      await reloadConversations();
+      await reloadConversations(undefined, undefined, true);
     } catch (err) {
       addToast('error', `恢复 Antigravity 失败：${errorMessage(err)}`);
     } finally {
@@ -539,6 +590,9 @@ export const App: React.FC = () => {
       const report = await api.scanClaude();
       setClaudeReport(report);
       setClaudeModalOpen(true);
+      if (conversations.length > 0) {
+        void reloadConversations();
+      }
     } catch (err) {
       addToast('error', `扫描 Claude 失败：${errorMessage(err)}`);
     } finally {
@@ -558,7 +612,7 @@ export const App: React.FC = () => {
         `Claude 恢复完成：新增 ${res.new_conversation_count} 个会话，解析 ${res.message_count} 条消息`
       );
       if (res.warnings.length > 0) addToast('warning', res.warnings.slice(0, 3).join('；'));
-      await reloadConversations();
+      await reloadConversations(undefined, undefined, true);
     } catch (err) {
       addToast('error', `恢复 Claude 失败：${errorMessage(err)}`);
     } finally {
@@ -893,6 +947,159 @@ export const App: React.FC = () => {
     }
   };
 
+  const handleOpenPrismProject = async (
+    path: string,
+    mode: PrismOpenMode = 'new-workspace'
+  ) => {
+    try {
+      await api.openInPrismStudio(path, mode);
+      addToast(
+        'success',
+        mode === 'parallel-root'
+          ? '已并列挂载到棱镜工坊当前空间'
+          : t.chat.toastOpenedInPrism
+      );
+    } catch (err) {
+      addToast('error', `打开棱镜工坊失败：${errorMessage(err)}`);
+    }
+  };
+
+  const handleOpenFileInPrism = async (
+    filePath: string,
+    line?: number,
+    projectPath?: string | null
+  ) => {
+    try {
+      await api.openInPrismStudio(filePath, 'file', line, projectPath);
+      addToast(
+        'success',
+        line ? `已在棱镜工坊定位至第 ${line} 行` : t.chat.toastOpenedInPrism
+      );
+    } catch (err) {
+      addToast('error', `在棱镜工坊打开文件失败：${errorMessage(err)}`);
+    }
+  };
+
+  const handleSendCodeToPrism = async (
+    lang: string,
+    code: string,
+    title: string,
+    projectPath?: string | null,
+    autoRun = false
+  ) => {
+    try {
+      await api.sendCodeToPrismStudio({
+        language: lang,
+        code,
+        title,
+        projectPath,
+        autoRun,
+      });
+      addToast(
+        'success',
+        autoRun ? '已送入棱镜工坊并启动运行' : t.chat.toastOpenedInPrism
+      );
+    } catch (err) {
+      addToast('error', `发送代码到棱镜工坊失败：${errorMessage(err)}`);
+    }
+  };
+
+  const handleReadConversationInPrism = async (conversationId: string) => {
+    try {
+      await api.openConversationInPrismStudio(conversationId);
+      addToast('success', '已在棱镜工坊打开会话精排视图');
+    } catch (err) {
+      addToast('error', `在棱镜工坊打开会话失败：${errorMessage(err)}`);
+    }
+  };
+
+  const applyBridgeFocus = useCallback(
+    (payload: VaultFocusPayload) => {
+      changePage('sessions');
+      if (payload.sourceKind === 'antigravity') {
+        handleSourceChange('antigravity');
+      } else if (payload.sourceKind === 'claude') {
+        handleSourceChange('claude');
+      } else if (payload.sourceKind) {
+        handleSourceChange('codex');
+      }
+      if (payload.conversationId) {
+        setSearchQuery('');
+        setSelectedId(payload.conversationId);
+      } else if (payload.projectPath) {
+        const parts = payload.projectPath.replace(/[\\/]+$/, '').split(/[\\/]/);
+        const base = parts[parts.length - 1] || payload.projectPath;
+        setSearchQuery(base);
+      }
+    },
+    []
+  );
+
+  const handleJumpConversationLink = async (idOrSourceId: string) => {
+    const direct = conversations.find((c) => c.id === idOrSourceId);
+    if (direct) {
+      applyBridgeFocus({
+        conversationId: direct.id,
+        sourceKind: direct.source_kind,
+      });
+      return;
+    }
+    try {
+      const resolved = await api.resolveConversationLink(idOrSourceId);
+      if (resolved && resolved.conversationId) {
+        applyBridgeFocus(resolved);
+      } else {
+        addToast('warning', `本地会话库尚未收录会话：${idOrSourceId}（可先点击右上角“扫描”）`);
+      }
+    } catch (err) {
+      addToast('error', `跳转会话失败：${errorMessage(err)}`);
+    }
+  };
+
+  const handleOpenExternalUrl = async (url: string) => {
+    try {
+      await api.openExternalUrl(url);
+    } catch (err) {
+      addToast('error', `打开网页链接失败：${errorMessage(err)}`);
+    }
+  };
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+
+    void api
+      .drainVaultBridgeFocus?.()
+      ?.then((items) => {
+        if (!cancelled && items && items.length > 0) {
+          applyBridgeFocus(items[items.length - 1]);
+        }
+      })
+      .catch(() => {});
+
+    if (
+      typeof window !== 'undefined' &&
+      ('__TAURI_INTERNALS__' in window || '__TAURI__' in window)
+    ) {
+      void import('@tauri-apps/api/event').then(({ listen }) => {
+        if (cancelled) return;
+        void listen<VaultFocusPayload>('cv://bridge-focus', (ev) => {
+          if (!cancelled && ev.payload) {
+            applyBridgeFocus(ev.payload);
+          }
+        }).then((fn) => {
+          if (cancelled) fn();
+          else unlisten = fn;
+        });
+      });
+    }
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [applyBridgeFocus]);
+
   const [isOpeningClient, setIsOpeningClient] = useState(false);
 
   const handleOpenClient = async (source?: 'codex' | 'antigravity' | 'claude') => {
@@ -923,8 +1130,14 @@ export const App: React.FC = () => {
   };
 
   return (
-    <div className="w-full h-full flex bg-[#f5f5f7] dark:bg-black overflow-hidden text-[#1d1d1f] dark:text-[#ededf0] transition-colors duration-200">
-      <NavRail page={page} onPageChange={changePage} theme={theme} onToggleTheme={toggleTheme} />
+    <div className="w-full h-full flex cv-canvas overflow-hidden text-[#0f172a] dark:text-[#e2e8f0] transition-colors duration-200">
+      <NavRail
+        page={page}
+        onPageChange={changePage}
+        theme={theme}
+        onToggleTheme={toggleTheme}
+        onOpenQuickLaunch={() => setQuickLaunchOpen(true)}
+      />
 
       {/* Only the active page is mounted; the others reload when opened. */}
       <div className="flex-1 min-w-0 flex flex-col overflow-hidden">
@@ -977,6 +1190,9 @@ export const App: React.FC = () => {
                 onBatchDelete={handleBatchDelete}
                 onOpenFolder={handleOpenFolder}
                 onOpenVSCode={handleOpenVSCode}
+                onOpenPrismProject={handleOpenPrismProject}
+                onReadConversationInPrism={handleReadConversationInPrism}
+                onHandoff={(conv) => setHandoffConv(conv)}
                 onRename={handleRename}
                 onDelete={handleDeleteSingle}
                 onSetPinned={handleSetPinned}
@@ -993,7 +1209,7 @@ export const App: React.FC = () => {
                 title={t.sidebar.resizerTooltip}
                 className={`sidebar-resizer ${
                   isResizing ? 'is-resizing' : ''
-                } bg-black/[0.04] dark:bg-white/[0.04] border-r border-black/[0.06] dark:border-white/[0.08] hover:bg-[#0071e3] transition-colors`}
+                } bg-[#f8fafc] dark:bg-[#121927] border-r border-slate-200/85 dark:border-slate-800/85 hover:bg-blue-600 transition-colors`}
               />
               <ChatView
                 conversation={activeConversation}
@@ -1005,6 +1221,18 @@ export const App: React.FC = () => {
                 onExportJson={handleExportJson}
                 onOpenFolder={handleOpenFolder}
                 onOpenVSCode={handleOpenVSCode}
+                onOpenPrismProject={handleOpenPrismProject}
+                onOpenFileInPrism={handleOpenFileInPrism}
+                onSendCodeToPrism={handleSendCodeToPrism}
+                onReadConversationInPrism={handleReadConversationInPrism}
+                onHandoff={(conv) =>
+                  setHandoffConv({
+                    ...conv,
+                    message_count: messages.length,
+                  })
+                }
+                onSelectConversation={handleJumpConversationLink}
+                onOpenExternalUrl={handleOpenExternalUrl}
               />
             </div>
           </>
@@ -1074,7 +1302,7 @@ export const App: React.FC = () => {
             `导入成功：新增 ${res.new_conversation_count} 个会话，共 ${res.message_count} 条消息`
           );
           if (res.warning_count > 0) addToast('warning', res.warnings.slice(0, 3).join('；'));
-          await reloadConversations();
+          await reloadConversations(undefined, undefined, true);
         }}
       />
 
@@ -1087,24 +1315,24 @@ export const App: React.FC = () => {
           widthClass="max-w-md"
         >
           <div className="flex flex-col gap-4 text-xs">
-            <div className="grid grid-cols-3 gap-2">
+            <div className="grid grid-cols-3 gap-2.5">
               {(
                 [
-                  [t.modals.codexPublishSelected, codexPublishDialog.preview.selected_thread_count, 'text-[#0071e3] dark:text-[#2997ff]'],
-                  [t.modals.codexPublishHidden, codexPublishDialog.preview.hidden_thread_count, 'text-[#c93400] dark:text-[#ff9f0a]'],
-                  [t.modals.codexPublishProjects, codexPublishDialog.preview.project_count, 'text-[#1d1d1f] dark:text-white'],
+                  [t.modals.codexPublishSelected, codexPublishDialog.preview.selected_thread_count, 'text-blue-600 dark:text-sky-400'],
+                  [t.modals.codexPublishHidden, codexPublishDialog.preview.hidden_thread_count, 'text-amber-600 dark:text-amber-400'],
+                  [t.modals.codexPublishProjects, codexPublishDialog.preview.project_count, 'text-slate-900 dark:text-white'],
                 ] as const
               ).map(([label, value, color]) => (
                 <div
                   key={label}
-                  className="p-3 rounded-2xl bg-black/[0.03] dark:bg-white/[0.04] border border-black/[0.06] dark:border-white/[0.08]"
+                  className="p-3 rounded-2xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200/80 dark:border-slate-700/70"
                 >
                   <div className={`text-xl font-semibold ${color}`}>{value}</div>
-                  <div className="text-[10px] text-[#86868b] mt-1 leading-snug">{label}</div>
+                  <div className="text-[10.5px] text-slate-500 dark:text-slate-400 mt-1 leading-snug">{label}</div>
                 </div>
               ))}
             </div>
-            <p className="text-[11px] text-[#6e6e73] dark:text-[#a1a1a6] leading-relaxed">
+            <p className="text-[11.5px] text-slate-500 dark:text-slate-400 leading-relaxed">
               {t.modals.codexPublishNote}
             </p>
             <div className="flex items-center justify-end gap-2 pt-1">
@@ -1139,24 +1367,24 @@ export const App: React.FC = () => {
             widthClass="max-w-md"
           >
             <div className="flex flex-col gap-4 text-xs">
-              <p className="text-[#1d1d1f] dark:text-[#ededf0] leading-relaxed">{t.modals.resetIntro}</p>
-              <div className="p-4 rounded-2xl border border-[#ff3b30]/25 bg-[#ff3b30]/[0.06] dark:border-[#ff453a]/30 dark:bg-[#ff453a]/10 space-y-2">
-                <p className="font-medium">
+              <p className="text-slate-800 dark:text-slate-200 leading-relaxed">{t.modals.resetIntro}</p>
+              <div className="p-4 rounded-2xl border border-rose-200 dark:border-rose-500/30 bg-rose-50/70 dark:bg-rose-500/10 space-y-2">
+                <p className="font-medium text-rose-700 dark:text-rose-300">
                   {interpolate(t.modals.resetScopeAll, {
                     convs: resetDialog.conversation_count,
                     msgs: resetDialog.message_count,
                   })}
                 </p>
-                <p className="text-[11px] text-[#6e6e73] dark:text-[#a1a1a6]">
+                <p className="text-[11px] text-slate-600 dark:text-slate-400">
                   {interpolate(t.modals.resetClearExclusions, { count: resetDialog.exclusion_count })}
                 </p>
                 {(resetDialog.folder_pin_count ?? 0) > 0 && (
-                  <p className="text-[11px] text-[#6e6e73] dark:text-[#a1a1a6]">
+                  <p className="text-[11px] text-slate-600 dark:text-slate-400">
                     {interpolate(t.modals.resetFolderPins, { count: resetDialog.folder_pin_count ?? 0 })}
                   </p>
                 )}
               </div>
-              <p className="text-[11px] text-[#6e6e73] dark:text-[#a1a1a6] bg-black/[0.03] dark:bg-white/[0.04] p-3 rounded-2xl leading-relaxed">
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 bg-slate-50 dark:bg-slate-800/50 border border-slate-200/70 dark:border-slate-700/60 p-3 rounded-2xl leading-relaxed">
                 {t.modals.resetBackupNote}
               </p>
               <div className="flex items-center justify-end gap-2 pt-1">
@@ -1196,7 +1424,7 @@ export const App: React.FC = () => {
             className="flex flex-col gap-4 text-xs"
           >
             <div>
-              <label className="block font-semibold text-[#86868b] mb-2">{t.modals.newTitleLabel}</label>
+              <label className="block font-semibold text-slate-500 dark:text-slate-400 mb-2">{t.modals.newTitleLabel}</label>
               <input
                 type="text"
                 autoFocus
@@ -1204,7 +1432,7 @@ export const App: React.FC = () => {
                 onChange={(e) =>
                   setRenameDialog({ ...renameDialog, newTitle: e.target.value })
                 }
-                className="w-full bg-black/[0.04] dark:bg-white/[0.06] text-[#1d1d1f] dark:text-[#ededf0] text-xs px-4 py-2 rounded-full border border-black/[0.08] dark:border-white/[0.08] focus:border-[#0071e3] focus:outline-none placeholder-[#86868b] transition-all"
+                className="w-full bg-white dark:bg-[#101725] text-slate-900 dark:text-slate-100 text-xs px-3.5 py-2.5 rounded-xl border border-slate-300/90 dark:border-slate-700 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/15 focus:outline-none placeholder-slate-400 transition-all"
               />
             </div>
             <div className="flex items-center justify-end gap-2 pt-2">
@@ -1228,8 +1456,8 @@ export const App: React.FC = () => {
           widthClass="max-w-md"
         >
           <div className="flex flex-col gap-4 text-xs">
-            <p className="text-[#1d1d1f] dark:text-[#ededf0] leading-relaxed break-words">{deleteDialog.title}</p>
-            <p className="text-[11px] text-[#d70015] dark:text-[#ff453a] bg-[#ff453a]/10 p-3.5 rounded-2xl border border-[#ff453a]/25 leading-relaxed">
+            <p className="text-slate-800 dark:text-slate-200 leading-relaxed break-words">{deleteDialog.title}</p>
+            <p className="text-[11px] text-rose-600 dark:text-rose-400 bg-rose-50 dark:bg-rose-500/10 p-3.5 rounded-2xl border border-rose-200 dark:border-rose-500/30 leading-relaxed">
               {t.modals.deleteWarning}
             </p>
             <div className="flex items-center justify-end gap-2 pt-2">
@@ -1242,6 +1470,29 @@ export const App: React.FC = () => {
             </div>
           </div>
         </Modal>
+      )}
+
+      {/* Quick Launch Modal */}
+      <QuickLaunchModal
+        isOpen={quickLaunchOpen}
+        onClose={() => setQuickLaunchOpen(false)}
+        contextFolder={activeConversation?.project_path ?? null}
+        onToast={addToast}
+      />
+
+      {/* Cross-Tool Conversation Handoff Modal */}
+      {handoffConv && (
+        <ConversationHandoffModal
+          isOpen
+          conversation={handoffConv}
+          onClose={() => setHandoffConv(null)}
+          onCompleted={(syncedCount) => {
+            if (syncedCount > 0) {
+              void reloadConversations(handoffConv.id, undefined, true);
+            }
+          }}
+          onToast={addToast}
+        />
       )}
 
       {/* Global Toast Container */}

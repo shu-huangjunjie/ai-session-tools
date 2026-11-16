@@ -103,6 +103,20 @@ pub fn percent_encode_path(input: &str) -> String {
     out
 }
 
+/// Percent-encodes an arbitrary URL query parameter value (RFC 3986 unreserved characters kept raw).
+pub fn percent_encode_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
+}
+
 /// Strips the `\\?\` prefix and converts separators so Explorer and VS Code accept the path.
 pub fn normalize_windows_path(path: &str) -> String {
     let trimmed = path.trim().trim_matches('"');
@@ -172,6 +186,12 @@ mod tests {
         let encoded = percent_encode_path(path);
         assert_eq!(encoded, "g%3A/%E5%B7%A5%E4%BD%9C/update%20ui_0326");
         assert_eq!(percent_decode(&encoded), path);
+        let comp = percent_encode_component("D:\\repos\\my app?a=1&b=中文");
+        assert_eq!(
+            comp,
+            "D%3A%5Crepos%5Cmy%20app%3Fa%3D1%26b%3D%E4%B8%AD%E6%96%87"
+        );
+        assert_eq!(percent_decode(&comp), "D:\\repos\\my app?a=1&b=中文");
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("%zz"), "%zz");
     }

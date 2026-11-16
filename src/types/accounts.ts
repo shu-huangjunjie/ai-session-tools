@@ -1,6 +1,14 @@
 /** Each client keeps its own accounts; switching one never touches another. */
 export type AccountClient = 'codex' | 'claude' | 'antigravity';
 
+export type AccountViewMode = 'grid' | 'list' | 'compact';
+
+export type AccountSortField = 'added' | 'last_used' | 'remaining' | 'reset' | 'name';
+
+export type AccountSortDirection = 'asc' | 'desc';
+
+export type AccountStatusFilter = 'all' | 'current' | 'available' | 'low' | 'error' | 'verification';
+
 export interface QuotaWindow {
   /** Codex `primary`/`secondary`, Claude `five_hour`/`seven_day…`, Antigravity model id. */
   kind: string;
@@ -21,7 +29,7 @@ export interface Quota {
 /** A saved account. Tokens stay in the backend and never reach the UI. */
 export interface AccountView {
   id: string;
-  /** Claude only: `oauth` (official login) or `provider` (relay). */
+  /** `oauth` (official login) or `provider` (API relay/provider). */
   kind?: 'oauth' | 'provider' | null;
   email?: string | null;
   name?: string | null;
@@ -39,6 +47,15 @@ export interface AccountView {
   quota?: Quota | null;
   quota_error?: string | null;
   quota_updated_at?: string | null;
+  verification_url?: string | null;
+  tags?: string[];
+  note?: string | null;
+  base_url?: string | null;
+  model?: string | null;
+  auth_field?: string | null;
+  haiku_model?: string | null;
+  sonnet_model?: string | null;
+  opus_model?: string | null;
 }
 
 export interface CurrentLogin {
@@ -57,11 +74,32 @@ export interface AccountsState {
   current_note?: string | null;
   notes: string[];
   accounts: AccountView[];
+  cockpit_import_count?: number;
+  cc_switch_available?: boolean;
 }
 
 export interface QuotaRefreshFailure {
   id: string;
   error: string;
+}
+
+export interface TokenImportResult {
+  imported: number;
+  failures: string[];
+}
+
+export interface CodexDeviceAuthStart {
+  device_auth_id: string;
+  user_code: string;
+  verification_url: string;
+  interval_secs: number;
+}
+
+export interface ProviderTestResult {
+  ok: boolean;
+  latency_ms: number;
+  models: string[];
+  message: string;
 }
 
 /** Adds or edits a Claude relay; an empty token keeps the saved one when editing. */
@@ -70,5 +108,18 @@ export interface ClaudeProviderInput {
   name: string;
   base_url: string;
   token?: string | null;
+  model?: string | null;
+  auth_field?: string | null;
+  haiku_model?: string | null;
+  sonnet_model?: string | null;
+  opus_model?: string | null;
+}
+
+/** Adds or edits a Codex API key provider; an empty api_key keeps the saved one when editing. */
+export interface CodexProviderInput {
+  id?: string | null;
+  name: string;
+  api_key: string;
+  base_url?: string | null;
   model?: string | null;
 }

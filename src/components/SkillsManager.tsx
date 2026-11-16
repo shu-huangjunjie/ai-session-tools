@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, Code2, Ellipsis, FolderMinus, FolderOpen, FolderPlus, Link2, Lock, Plus, RefreshCw, Search, Trash2 } from 'lucide-react';
+import { AlertTriangle, Code2, Ellipsis, FolderMinus, FolderOpen, FolderPlus, Link2, Lock, Plus, RefreshCw, Search, Sparkles, Trash2 } from 'lucide-react';
 import { api, errorMessage } from '../api/client';
 import { SkillClient, SkillLocation } from '../types';
 import { formatDateTime } from '../utils/formatters';
@@ -268,12 +268,12 @@ export const SkillsManager: React.FC<SkillsManagerProps> = ({ onToast }) => {
         }
       >
         <div className="relative">
-          <Search size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#86868b]" />
+          <Search size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder={s.search}
-            className="w-56 bg-black/[0.045] dark:bg-white/[0.07] pl-8 pr-3 py-1.5 rounded-lg border border-transparent focus:border-[#0071e3] focus:outline-none placeholder-[#86868b]"
+            className="w-56 bg-slate-100/90 dark:bg-[#101725] text-slate-800 dark:text-slate-100 pl-8 pr-3 py-1.5 rounded-lg border border-slate-200/85 dark:border-slate-700/75 focus:border-blue-500 focus:bg-white dark:focus:bg-[#162033] focus:outline-none placeholder-slate-400 transition-all"
           />
         </div>
         <Button
@@ -312,14 +312,14 @@ export const SkillsManager: React.FC<SkillsManagerProps> = ({ onToast }) => {
       </PageHeader>
 
       <div className="flex-1 flex min-h-0">
-        <div className="flex-1 min-w-0 flex flex-col bg-white dark:bg-[#121214] border-r border-black/[0.06] dark:border-white/[0.08]">
+        <div className="flex-1 min-w-0 flex flex-col bg-white/75 dark:bg-[#121a2a]/75 backdrop-blur-md border-r border-slate-200/75 dark:border-slate-800/80">
           <div className="flex-1 overflow-y-auto">
             <table className="w-full border-separate border-spacing-0" role="grid">
               <thead>
-                <tr className="text-[11px] text-[#86868b]">
-                  <th className="sticky top-0 z-10 bg-white dark:bg-[#121214] text-left font-medium px-4 py-2.5 border-b border-black/[0.06] dark:border-white/[0.08]">{s.columnSkill}</th>
+                <tr className="text-[11px] text-slate-500 dark:text-slate-400">
+                  <th className="sticky top-0 z-10 bg-slate-50/88 dark:bg-[#101725]/88 backdrop-blur-md text-left font-semibold px-4 py-2.5 border-b border-slate-200/80 dark:border-slate-800/85">{s.columnSkill}</th>
                   {CLIENTS.map((c) => (
-                    <th key={c} className="sticky top-0 z-10 bg-white dark:bg-[#121214] text-left font-medium px-4 py-2 w-[120px] border-b border-black/[0.06] dark:border-white/[0.08]">
+                    <th key={c} className="sticky top-0 z-10 bg-slate-50/88 dark:bg-[#101725]/88 backdrop-blur-md text-left font-semibold px-4 py-2 w-[120px] border-b border-slate-200/80 dark:border-slate-800/85">
                       <div className="flex flex-col items-start gap-0.5">
                         <span>{CLIENT_LABEL[c]}</span>
                         <button
@@ -328,7 +328,7 @@ export const SkillsManager: React.FC<SkillsManagerProps> = ({ onToast }) => {
                           disabled={busy || offIn(c).length === 0}
                           title={interpolate(s.enableAllTooltip, { client: CLIENT_LABEL[c], count: offIn(c).length })}
                           aria-label={interpolate(s.enableAllIn, { client: CLIENT_LABEL[c] })}
-                          className="text-[11px] font-normal text-[#0071e3] dark:text-[#2997ff] hover:underline disabled:text-[#86868b] disabled:opacity-50 disabled:no-underline disabled:cursor-default"
+                          className="text-[11px] font-normal text-blue-600 dark:text-sky-400 hover:underline disabled:text-slate-400 disabled:opacity-50 disabled:no-underline disabled:cursor-default"
                         >
                           {s.enableAll}
                         </button>
@@ -340,15 +340,15 @@ export const SkillsManager: React.FC<SkillsManagerProps> = ({ onToast }) => {
               <tbody>
                 {visibleGroups.length === 0 && (
                   <tr>
-                    <td colSpan={3} className="text-center text-[#86868b] py-10">{query ? s.noMatch : s.empty}</td>
+                    <td colSpan={3} className="text-center text-slate-400 py-10">{query ? s.noMatch : s.empty}</td>
                   </tr>
                 )}
                 {visibleGroups.map((group) => (
                   <tr
                     key={group.key}
-                    className={selected?.key === group.key ? 'bg-[#0071e3]/[0.05] dark:bg-[#2997ff]/10' : 'hover:bg-black/[0.02] dark:hover:bg-white/[0.03]'}
+                    className={selected?.key === group.key ? 'bg-blue-50/80 dark:bg-blue-500/12' : 'hover:bg-slate-50/80 dark:hover:bg-white/[0.03]'}
                   >
-                    <td className="px-4 py-2.5 border-b border-black/[0.05] dark:border-white/[0.06] max-w-0">
+                    <td className="px-4 py-2.5 border-b border-slate-100 dark:border-slate-800/80 max-w-0">
                       <button
                         type="button"
                         onClick={() => {
@@ -358,21 +358,21 @@ export const SkillsManager: React.FC<SkillsManagerProps> = ({ onToast }) => {
                         className="text-left w-full min-w-0"
                       >
                         <div className="flex items-center gap-1.5 flex-wrap">
-                          <span className={`font-semibold text-[13px] text-[#1d1d1f] dark:text-white ${isOff(group) ? 'opacity-60' : ''}`}>{group.name}</span>
+                          <span className={`font-semibold text-[13px] text-slate-900 dark:text-white ${isOff(group) ? 'opacity-60' : ''}`}>{group.name}</span>
                           {badges(group)}
                         </div>
-                        <div className="mt-0.5 text-[11.5px] text-[#86868b] truncate">
-                          <span className="text-[#6e6e73] dark:text-[#a1a1a6]">{originLabel(group)}</span>
+                        <div className="mt-0.5 text-[11.5px] text-slate-500 dark:text-slate-400 truncate">
+                          <span className="text-[#6e6e73] dark:text-slate-300">{originLabel(group)}</span>
                           {group.description && ` · ${group.description}`}
                         </div>
                       </button>
                     </td>
                     {CLIENTS.map((client) => (
-                      <td key={client} className="px-4 py-2.5 border-b border-black/[0.05] dark:border-white/[0.06]">
+                      <td key={client} className="px-4 py-2.5 border-b border-slate-100 dark:border-slate-800/80">
                         {group.clients[client]?.system ? (
                           <Badge tone="purple"><Lock size={9} />{s.stateBuiltIn}</Badge>
                         ) : group.system ? (
-                          <span className="text-[#86868b]">—</span>
+                          <span className="text-slate-400">—</span>
                         ) : (
                           <Switch
                             checked={isOnIn(group, client)}
@@ -389,7 +389,7 @@ export const SkillsManager: React.FC<SkillsManagerProps> = ({ onToast }) => {
               </tbody>
             </table>
           </div>
-          <div className="px-4 py-2.5 border-t border-black/[0.06] dark:border-white/[0.08] text-[11px] text-[#86868b] flex flex-col gap-1">
+          <div className="px-4 py-2.5 border-t border-slate-200/85 dark:border-slate-800/85 bg-slate-50/60 dark:bg-[#111827]/60 text-[11px] text-slate-500 dark:text-slate-400 flex flex-col gap-1">
             {locations.map((l) => (
               <div key={`${l.kind}:${l.root}`} className="flex items-center gap-1.5 min-w-0">
                 <span className="font-semibold shrink-0">{l.kind === 'library' ? `${s.library} · ${baseName(l.root)}` : CLIENT_LABEL[l.kind]}</span>
@@ -408,7 +408,7 @@ export const SkillsManager: React.FC<SkillsManagerProps> = ({ onToast }) => {
         </div>
 
         {/* Detail or create form */}
-        <div className="w-[440px] flex-shrink-0 overflow-y-auto p-6 select-text">
+        <div className="w-[440px] flex-shrink-0 overflow-y-auto p-6 bg-slate-50/55 dark:bg-[#0d1320]/65 backdrop-blur-sm select-text">
           {creating ? (
             <CreateSkillForm
               locations={locations}
@@ -497,6 +497,25 @@ export const SkillsManager: React.FC<SkillsManagerProps> = ({ onToast }) => {
                   </dl>
 
                   <div className="flex items-center gap-2 flex-wrap">
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      icon={<Sparkles size={13} />}
+                      disabled={!folder || selected.linkBroken}
+                      onClick={() =>
+                        folder &&
+                        run(async () => {
+                          if (selected.hasSkillFile && previewPath) {
+                            await api.openInPrismStudio(previewPath, 'file', undefined, folder);
+                          } else {
+                            await api.openInPrismStudio(folder, 'new-workspace');
+                          }
+                          onToast('success', t.chat.toastOpenedInPrism);
+                        })
+                      }
+                    >
+                      {s.openPrism}
+                    </Button>
                     <Button size="sm" icon={<FolderOpen size={13} />} disabled={!folder || selected.linkBroken} onClick={() => folder && run(() => api.openFolder(folder))}>
                       {s.openFolder}
                     </Button>

@@ -1184,3 +1184,344 @@ fn antigravity_scan_keeps_rows_with_null_columns() {
         "2026-02-02T08:54:59.689224400+00:00"
     );
 }
+
+#[test]
+fn antigravity_excludes_subagents_detects_incremental_updates_and_preserves_recency_on_title_sync() {
+    use context_vault_lib::services::AntigravityRecoveryService;
+    let (root, db) = fixture("ag-incremental");
+    let home = root.join("antigravity");
+
+    let write_transcript = |cid: &str, body: &str| {
+        let logs = home.join(format!("brain/{cid}/.system_generated/logs"));
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("transcript.jsonl"), body).unwrap();
+    };
+
+    write_transcript(
+        "conv-main",
+        concat!(
+            "{\"step_index\":0,\"type\":\"USER_INPUT\",\"created_at\":\"2026-11-10T08:00:00Z\",\"content\":\"<USER_REQUEST>initial question</USER_REQUEST>\"}\n",
+            "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-11-10T08:01:00Z\",\"content\":\"short reply\"}\n"
+        ),
+    );
+    // Both indexed subagents also have brain/ directories and must not leak via fallback scan.
+    write_transcript(
+        "sub-nested",
+        "{\"step_index\":0,\"type\":\"USER_INPUT\",\"created_at\":\"2026-11-10T08:02:00Z\",\"content\":\"subagent prompt\"}\n",
+    );
+    write_transcript(
+        "sub-named",
+        "{\"step_index\":0,\"type\":\"USER_INPUT\",\"created_at\":\"2026-11-10T08:03:00Z\",\"content\":\"research subagent prompt\"}\n",
+    );
+    // Unindexed subagent directory with only SYSTEM_MESSAGE + PLANNER_RESPONSE.
+    write_transcript(
+        "sub-unindexed",
+        concat!(
+            "{\"step_index\":0,\"type\":\"SYSTEM_MESSAGE\",\"created_at\":\"2026-11-10T08:04:00Z\",\"content\":\"system task\"}\n",
+            "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-11-10T08:05:00Z\",\"content\":\"subagent output\"}\n"
+        ),
+    );
+
+    let summaries = Connection::open(home.join("conversation_summaries.db")).unwrap();
+    summaries
+        .execute_batch(
+            "CREATE TABLE conversation_summaries (
+                conversation_id TEXT PRIMARY KEY, title TEXT, preview TEXT, step_count INTEGER,
+                last_modified_time datetime, workspace_uris TEXT, status TEXT, agent_name TEXT,
+                nesting_depth INTEGER, parent_conversation_id TEXT
+             );
+             INSERT INTO conversation_summaries VALUES
+                ('conv-main', 'Initial Title', 'short reply', 2, '2026-11-10T08:01:00Z', '[\"file:///c%3A/demo\"]', 'IDLE', '', 0, ''),
+                ('sub-nested', '', 'sub', 2, '2026-11-10T08:02:00Z', '[]', 'IDLE', '', 1, 'conv-main'),
+                ('sub-named', '', 'sub', 2, '2026-11-10T08:03:00Z', '[]', 'IDLE', 'research', 0, '');",
+        )
+        .unwrap();
+
+    let service = AntigravityRecoveryService::new(&db, Some(&home));
+    let first_scan = service.scan();
+    assert_eq!(first_scan.candidates.len(), 1);
+    assert_eq!(first_scan.candidates[0].conversation_id, "conv-main");
+    assert!(!first_scan.candidates[0].exists_locally);
+    assert!(!first_scan.candidates[0].has_updates);
+
+    let rec1 = service.recover(&first_scan.candidates);
+    assert_eq!(rec1.new_conversation_count, 1);
+    assert_eq!(rec1.message_count, 2);
+
+    let repo = Repository::new(&db);
+    let vault_conv = repo.list_conversations(false, None).unwrap().remove(0);
+    assert_eq!(vault_conv.updated_at.to_rfc3339(), "2026-11-10T08:01:00+00:00");
+
+    // Second scan with no changes: exists_locally = true, has_updates = false.
+    let unchanged_scan = service.scan();
+    assert!(unchanged_scan.candidates[0].exists_locally);
+    assert!(!unchanged_scan.candidates[0].has_updates);
+
+    // Title-only change in Antigravity index updates title during scan without bumping updated_at.
+    summaries
+        .execute(
+            "UPDATE conversation_summaries SET title = 'Indexed Title v2' WHERE conversation_id = 'conv-main'",
+            [],
+        )
+        .unwrap();
+    let title_scan = service.scan();
+    assert!(!title_scan.candidates[0].has_updates);
+    assert_eq!(service.sync_existing_titles(&title_scan.candidates), 1);
+    let after_title = repo.get_conversation(&vault_conv.id).unwrap().unwrap();
+    assert_eq!(after_title.title, "Indexed Title v2");
+    assert_eq!(after_title.updated_at, vault_conv.updated_at);
+
+    // Growing an existing message in place flags has_updates and updates content on recover.
+    write_transcript(
+        "conv-main",
+        concat!(
+            "{\"step_index\":0,\"type\":\"USER_INPUT\",\"created_at\":\"2026-11-10T08:00:00Z\",\"content\":\"<USER_REQUEST>initial question</USER_REQUEST>\"}\n",
+            "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-11-10T08:01:00Z\",\"content\":\"expanded assistant reply with more details\"}\n"
+        ),
+    );
+    let grown_scan = service.scan();
+    assert!(grown_scan.candidates[0].has_updates);
+    let rec_grown = service.recover(&grown_scan.candidates);
+    assert_eq!(rec_grown.message_count, 1);
+    assert_eq!(
+        repo.load_active_path(&vault_conv.id).unwrap()[1].content,
+        "expanded assistant reply with more details"
+    );
+    assert!(!service.scan().candidates[0].has_updates);
+
+    // Appending a new turn flags has_updates, appends messages, and advances updated_at.
+    write_transcript(
+        "conv-main",
+        concat!(
+            "{\"step_index\":0,\"type\":\"USER_INPUT\",\"created_at\":\"2026-11-10T08:00:00Z\",\"content\":\"<USER_REQUEST>initial question</USER_REQUEST>\"}\n",
+            "{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-11-10T08:01:00Z\",\"content\":\"expanded assistant reply with more details\"}\n",
+            "{\"step_index\":2,\"type\":\"USER_INPUT\",\"created_at\":\"2026-11-11T09:30:00Z\",\"content\":\"<USER_REQUEST>follow-up question</USER_REQUEST>\"}\n",
+            "{\"step_index\":3,\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-11-11T09:31:00Z\",\"content\":\"follow-up answer\"}\n"
+        ),
+    );
+    let appended_scan = service.scan();
+    assert!(appended_scan.candidates[0].has_updates);
+    let rec_appended = service.recover(&appended_scan.candidates);
+    assert_eq!(rec_appended.message_count, 2);
+    let after_append = repo.get_conversation(&vault_conv.id).unwrap().unwrap();
+    assert_eq!(after_append.updated_at.to_rfc3339(), "2026-11-11T09:31:00+00:00");
+    assert_eq!(repo.load_active_path(&vault_conv.id).unwrap().len(), 4);
+    assert!(!service.scan().candidates[0].has_updates);
+}
+
+#[test]
+fn codex_supports_modern_codex_db_and_publishes_user_edited_titles() {
+    use context_vault_lib::services::{CodexClientPublisher, CodexRecoveryService};
+    let (root, db) = fixture("codex-modern-db");
+    let home = codex_home(&root);
+    fs::rename(
+        home.join("sqlite/codex-dev.db"),
+        home.join("sqlite/codex.db"),
+    )
+    .unwrap();
+    let first = "11111111-1111-1111-1111-111111111111";
+    fs::write(
+        home.join("session_index.jsonl"),
+        format!("{{\"id\":\"{first}\",\"thread_name\":\"Old Index Name\"}}\n"),
+    )
+    .unwrap();
+
+    let recovery = CodexRecoveryService::new(&db, Some(&home));
+    let scan = recovery.scan();
+    assert!(scan.warnings.is_empty(), "{:?}", scan.warnings);
+    assert_eq!(scan.candidates.len(), 2);
+    recovery.recover(&scan.candidates);
+
+    // Appending to rollout marks has_updates = true on rescan.
+    let rollout_path = PathBuf::from(&scan.candidates.iter().find(|c| c.thread_id == first).unwrap().rollout_path);
+    let mut rollout = fs::read_to_string(&rollout_path).unwrap();
+    rollout.push_str(
+        "{\"timestamp\":\"2026-10-01T10:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"new codex turn\"}}\n",
+    );
+    fs::write(&rollout_path, rollout).unwrap();
+    let updated_scan = recovery.scan();
+    assert!(
+        updated_scan
+            .candidates
+            .iter()
+            .find(|c| c.thread_id == first)
+            .unwrap()
+            .has_updates
+    );
+    recovery.recover(&updated_scan.candidates);
+    assert!(
+        !recovery
+            .scan()
+            .candidates
+            .iter()
+            .find(|c| c.thread_id == first)
+            .unwrap()
+            .has_updates
+    );
+
+    // Rename in Context Vault and publish back to Codex (sqlite/codex.db + state_5 + session_index).
+    let repo = Repository::new(&db);
+    let mapping = repo
+        .source_ids_by_conversation(CodexRecoveryService::SOURCE_TYPE)
+        .unwrap();
+    let first_vault_id = mapping
+        .iter()
+        .find(|(_, tid)| tid.as_str() == first)
+        .unwrap()
+        .0
+        .clone();
+    repo.rename_conversation(&first_vault_id, "Vault Custom Codex Title")
+        .unwrap();
+
+    let overrides = repo
+        .user_edited_titles_for_source(CodexRecoveryService::SOURCE_TYPE)
+        .unwrap();
+    assert_eq!(
+        overrides.get(first).map(String::as_str),
+        Some("Vault Custom Codex Title")
+    );
+
+    let publisher = CodexClientPublisher::new(Some(&home), &root.join("backups"));
+    let preview = publisher.preview(&[first.to_string()]).unwrap();
+    assert_eq!(preview.selected_thread_count, 1);
+    let result = publisher
+        .publish_with_titles(&[first.to_string()], &[], &overrides)
+        .unwrap();
+    assert_eq!(result.catalog_thread_count, 1);
+
+    let backup_dir = PathBuf::from(&result.backup_directory);
+    assert!(backup_dir.join("codex.db").is_file());
+    assert!(backup_dir.join("session_index.jsonl").is_file());
+
+    let state = Connection::open(home.join("state_5.sqlite")).unwrap();
+    let (st_title, st_name): (String, String) = state
+        .query_row(
+            "SELECT title, name FROM threads WHERE id = ?1",
+            [first],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(st_title, "Vault Custom Codex Title");
+    assert_eq!(st_name, "Vault Custom Codex Title");
+
+    let catalog = Connection::open(home.join("sqlite/codex.db")).unwrap();
+    let cat_title: String = catalog
+        .query_row(
+            "SELECT display_title FROM local_thread_catalog WHERE thread_id = ?1",
+            [first],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cat_title, "Vault Custom Codex Title");
+
+    let index_content = fs::read_to_string(home.join("session_index.jsonl")).unwrap();
+    assert!(index_content.contains("Vault Custom Codex Title"));
+}
+
+#[test]
+fn antigravity_publish_preserves_trajectory_id_and_updates_annotations_and_agyhub_proto() {
+    use context_vault_lib::services::AntigravityRecoveryService;
+    let (root, db) = fixture("ag-publish-proto");
+    let home = root.join("antigravity");
+    let ag_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let logs = home.join(format!("brain/{ag_id}/.system_generated/logs"));
+    fs::create_dir_all(&logs).unwrap();
+    fs::write(
+        logs.join("transcript.jsonl"),
+        "{\"step_index\":0,\"type\":\"USER_INPUT\",\"created_at\":\"2026-11-12T10:00:00Z\",\"content\":\"<USER_REQUEST>hello ag</USER_REQUEST>\"}\n",
+    )
+    .unwrap();
+
+    // Build a realistic TrajectorySummary protobuf:
+    // field 1 (string): "Old AG Title"
+    // field 4 (string): "traj-keep-9999"
+    // field 15 (message): { field 1 (string): "Old AG Title", field 7 (message): { field 1 (varint): 1770000000 } }
+    fn ld_field(field_no: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![(field_no << 3) | 2, payload.len() as u8];
+        out.extend_from_slice(payload);
+        out
+    }
+    let mut ann_msg = ld_field(1, b"Old AG Title");
+    ann_msg.extend_from_slice(&ld_field(7, &[0x08, 0x80, 0x94, 0xeb, 0xab, 0x06]));
+    let mut initial_raw = ld_field(1, b"Old AG Title");
+    initial_raw.extend_from_slice(&ld_field(4, b"traj-keep-9999"));
+    initial_raw.extend_from_slice(&ld_field(15, &ann_msg));
+
+    let summaries = Connection::open(home.join("conversation_summaries.db")).unwrap();
+    summaries
+        .execute_batch(
+            "CREATE TABLE conversation_summaries (
+                conversation_id TEXT PRIMARY KEY, title TEXT, preview TEXT, step_count INTEGER,
+                last_modified_time datetime, workspace_uris TEXT, status TEXT, source TEXT,
+                project_id TEXT, agent_name TEXT, parent_conversation_id TEXT, nesting_depth INTEGER,
+                battle_id TEXT, winning_conversation_id TEXT, not_fully_idle INTEGER, killed INTEGER,
+                last_user_input_time datetime, last_user_input_step_index INTEGER, app_data_dir TEXT,
+                raw_summary BLOB, group_id TEXT
+             );",
+        )
+        .unwrap();
+    summaries
+        .execute(
+            "INSERT INTO conversation_summaries VALUES (
+                ?1, 'Old AG Title', 'hello ag', 5, '2026-11-12T10:00:00Z',
+                '[\"file:///d%3A/demo\"]', 'CASCADE_RUN_STATUS_IDLE', '', 'outside-of-project',
+                '', '', 0, '', '', 0, 0, '2026-11-12T10:00:00Z', 0, 'antigravity', ?2, ''
+             )",
+            rusqlite::params![ag_id, &initial_raw],
+        )
+        .unwrap();
+    drop(summaries);
+
+    let annotations_dir = home.join("annotations");
+    fs::create_dir_all(&annotations_dir).unwrap();
+    fs::write(
+        annotations_dir.join(format!("{ag_id}.pbtxt")),
+        "title:\"Old AG Title\"\nlast_user_view_time:{seconds:1770000000}\n",
+    )
+    .unwrap();
+
+    // agyhub_summaries_proto.pb: repeated field 1 { 1: key, 2: TrajectorySummary }
+    let mut map_entry = ld_field(1, ag_id.as_bytes());
+    map_entry.extend_from_slice(&ld_field(2, &initial_raw));
+    let agyhub_initial = ld_field(1, &map_entry);
+    fs::write(home.join("agyhub_summaries_proto.pb"), &agyhub_initial).unwrap();
+
+    let recovery = AntigravityRecoveryService::new(&db, Some(&home));
+    recovery.recover(&recovery.scan().candidates);
+
+    let repo = Repository::new(&db);
+    let vault_id = repo.list_conversations(false, None).unwrap().remove(0).id;
+    repo.rename_conversation(&vault_id, "Renamed AG Title").unwrap();
+
+    let publisher = AntigravityPublisher::new(&db, Some(&home), &root.join("backups"));
+    let pub_res = publisher.publish(std::slice::from_ref(&vault_id)).unwrap();
+    assert_eq!(pub_res.published_count, 1);
+    assert_eq!(pub_res.updated_count, 1);
+    assert!(pub_res.backup_path.is_some());
+
+    let contains_subslice = |haystack: &[u8], needle: &[u8]| {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    };
+
+    let updated_db = Connection::open(home.join("conversation_summaries.db")).unwrap();
+    let (db_title, db_raw): (String, Vec<u8>) = updated_db
+        .query_row(
+            "SELECT title, raw_summary FROM conversation_summaries WHERE conversation_id = ?1",
+            [ag_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(db_title, "Renamed AG Title");
+    assert!(contains_subslice(&db_raw, b"traj-keep-9999"));
+    assert!(contains_subslice(&db_raw, b"Renamed AG Title"));
+    assert!(!contains_subslice(&db_raw, b"Old AG Title"));
+
+    let pbtxt = fs::read_to_string(annotations_dir.join(format!("{ag_id}.pbtxt"))).unwrap();
+    assert!(pbtxt.contains("title:\"Renamed AG Title\""));
+    assert!(pbtxt.contains("last_user_view_time:{seconds:1770000000}"));
+
+    let agyhub_after = fs::read(home.join("agyhub_summaries_proto.pb")).unwrap();
+    assert!(contains_subslice(&agyhub_after, b"traj-keep-9999"));
+    assert!(contains_subslice(&agyhub_after, b"Renamed AG Title"));
+    assert!(!contains_subslice(&agyhub_after, b"Old AG Title"));
+}

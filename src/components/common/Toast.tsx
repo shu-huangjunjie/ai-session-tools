@@ -21,10 +21,10 @@ export const ToastContainer: React.FC<ToastContainerProps> = ({ toasts, onDismis
     <div className="fixed bottom-6 right-6 z-50 flex flex-col gap-2.5 max-w-sm pointer-events-none select-none">
       {toasts.map((t) => {
         const iconColor = {
-          success: 'text-emerald-400',
-          warning: 'text-amber-400',
-          error: 'text-[#ff453a]',
-          info: 'text-[#2997ff]',
+          success: 'text-emerald-600 dark:text-emerald-400',
+          warning: 'text-amber-500 dark:text-amber-400',
+          error: 'text-rose-600 dark:text-rose-400',
+          info: 'text-blue-600 dark:text-sky-400',
         }[t.type];
 
         const Icon = {
@@ -38,7 +38,7 @@ export const ToastContainer: React.FC<ToastContainerProps> = ({ toasts, onDismis
           <div
             key={t.id}
             onClick={() => onDismiss(t.id)}
-            className="pointer-events-auto flex items-center gap-2.5 px-4 py-2.5 rounded-full border border-white/[0.12] bg-[#1c1c1e]/90 backdrop-blur-2xl shadow-[0_8px_32px_rgba(0,0,0,0.6)] text-xs font-medium text-[#f5f5f7] cursor-pointer transition-all hover:scale-[1.02] active:scale-[0.98] animate-in slide-in-from-bottom-3 duration-200"
+            className="pointer-events-auto flex items-center gap-2.5 px-4 py-2.5 rounded-2xl border border-slate-200/95 dark:border-slate-700/85 bg-white/96 dark:bg-[#1a2436]/96 backdrop-blur-xl shadow-[0_10px_28px_rgba(15,23,42,0.12)] dark:shadow-[0_12px_36px_rgba(0,0,0,0.5)] text-xs font-medium text-slate-800 dark:text-slate-100 cursor-pointer transition-all hover:scale-[1.01] active:scale-[0.98] animate-in slide-in-from-bottom-3 duration-200"
           >
             <Icon size={15} className={`flex-shrink-0 ${iconColor}`} />
             <span className="flex-1 leading-snug tracking-tight">{t.message}</span>

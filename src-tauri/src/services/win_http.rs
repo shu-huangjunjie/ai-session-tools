@@ -15,17 +15,53 @@ impl HttpResponse {
     }
 }
 
-/// 同步请求；`url` 必须是 https。超时 20 秒。
+fn split_url(url: &str) -> Result<(bool, &str, u16, String), String> {
+    let (is_https, rest) = if let Some(r) = url.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (false, r)
+    } else {
+        return Err("只支持 http 或 https 地址".into());
+    };
+    let (authority, path) = match rest.find(['/', '?']) {
+        Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], rest[i..].to_string()),
+        Some(i) => (&rest[..i], format!("/{}", &rest[i..])),
+        None => (rest, "/".to_string()),
+    };
+    if authority.is_empty() {
+        return Err("请求地址缺少主机名".into());
+    }
+    let default_port = if is_https { 443 } else { 80 };
+    let (host, port) = if let Some(after_bracket) = authority.strip_prefix('[') {
+        let end = after_bracket.find(']').ok_or_else(|| "无效的 IPv6 地址".to_string())?;
+        let host = &after_bracket[..end];
+        let tail = &after_bracket[end + 1..];
+        let port = match tail.strip_prefix(':') {
+            Some(p) if !p.is_empty() => p.parse::<u16>().map_err(|_| "无效的端口号".to_string())?,
+            Some(_) => return Err("无效的端口号".into()),
+            None if tail.is_empty() => default_port,
+            None => return Err("无效的主机地址".into()),
+        };
+        (host, port)
+    } else if let Some((h, p)) = authority.split_once(':') {
+        if h.is_empty() || p.is_empty() {
+            return Err("无效的主机或端口".into());
+        }
+        let port = p.parse::<u16>().map_err(|_| "无效的端口号".to_string())?;
+        (h, port)
+    } else {
+        (authority, default_port)
+    };
+    Ok((is_https, host, port, path))
+}
+
+/// 同步请求；支持 http / https 与自定义端口。超时 20 秒。
 #[cfg(windows)]
 pub fn request(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8]>) -> Result<HttpResponse, String> {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::Networking::WinHttp::*;
 
-    let rest = url.strip_prefix("https://").ok_or("只支持 https 地址")?;
-    let (host, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
+    let (is_https, host, port, path) = split_url(url)?;
 
     /// 关闭 WinHTTP 句柄。
     struct Handle(*mut core::ffi::c_void);
@@ -58,16 +94,21 @@ pub fn request(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&
             "初始化网络",
         )?;
         WinHttpSetTimeouts(session.0, 10_000, 10_000, 20_000, 20_000).map_err(|e| e.message())?;
-        let connect = check(WinHttpConnect(session.0, &HSTRING::from(host), 443, 0), "连接服务器")?;
+        let connect = check(WinHttpConnect(session.0, &HSTRING::from(host), port, 0), "连接服务器")?;
+        let flags = if is_https {
+            WINHTTP_FLAG_SECURE
+        } else {
+            WINHTTP_OPEN_REQUEST_FLAGS::default()
+        };
         let req = check(
             WinHttpOpenRequest(
                 connect.0,
                 &HSTRING::from(method),
-                &HSTRING::from(path),
+                &HSTRING::from(path.as_str()),
                 PCWSTR::null(),
                 PCWSTR::null(),
                 core::ptr::null(),
-                WINHTTP_FLAG_SECURE,
+                flags,
             ),
             "创建请求",
         )?;

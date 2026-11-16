@@ -6,3 +6,5 @@ export * from './import';
 export * from './skills';
 export * from './mcp';
 export * from './accounts';
+export * from './handoff';
+export * from './quickLaunch';

@@ -62,6 +62,8 @@ pub struct CodexThreadCandidate {
     pub rollout_path: String,
     pub project_path: Option<String>,
     pub exists_locally: bool,
+    #[serde(default)]
+    pub has_updates: bool,
     pub model: Option<String>,
     pub observed_providers: Vec<String>,
     pub updated_at: String,
@@ -165,18 +167,22 @@ impl<'a> CodexRecoveryService<'a> {
         let mut warnings = Vec::new();
 
         let mut sources: Vec<(String, PathBuf)> = Vec::new();
-        let catalog_path = self.codex_home.join("sqlite").join("codex-dev.db");
+        let catalog_paths: Vec<PathBuf> = ["codex.db", "codex-dev.db"]
+            .into_iter()
+            .map(|name| self.codex_home.join("sqlite").join(name))
+            .filter(|p| p.is_file())
+            .collect();
         // The catalog caches every thread Codex has seen, not just the ones its
-        // sidebar lists.
-        if catalog_path.is_file() {
-            sources.push(("Codex 线程缓存".to_string(), catalog_path.clone()));
+        // sidebar lists. Newer Codex releases name it `codex.db`; older ones `codex-dev.db`.
+        for p in &catalog_paths {
+            sources.push(("Codex 线程缓存".to_string(), p.clone()));
         }
         for (lbl, p) in self.state_index_paths() {
             sources.push((lbl, p));
         }
 
         for (label, path) in &sources {
-            let rows_res = if *path == catalog_path {
+            let rows_res = if catalog_paths.contains(path) {
                 Self::read_catalog_index(path)
             } else {
                 Self::read_thread_index(path, false)
@@ -269,7 +275,9 @@ impl<'a> CodexRecoveryService<'a> {
         }
 
         let excluded_ids = repo.excluded_source_ids(Self::SOURCE_TYPE).unwrap_or_default();
-        let imported_ids = repo.imported_source_ids(Self::SOURCE_TYPE).unwrap_or_default();
+        let imported_snapshots = repo
+            .imported_source_snapshots(Self::SOURCE_TYPE)
+            .unwrap_or_default();
 
         let history_path = self.history_db_path();
         let history = history_path
@@ -321,6 +329,40 @@ impl<'a> CodexRecoveryService<'a> {
                 .available
                 .then(|| sidebar.placement(&item.thread_id, &archived_ids));
 
+            let exists_locally = imported_snapshots.contains_key(&item.thread_id);
+            let has_updates = imported_snapshots
+                .get(&item.thread_id)
+                .map(|snap| {
+                    if history_only {
+                        let from_history = repo
+                            .has_source_message_prefix(
+                                Self::SOURCE_TYPE,
+                                &item.thread_id,
+                                HISTORY_ID_PREFIX,
+                            )
+                            .unwrap_or(false);
+                        if !from_history {
+                            return false;
+                        }
+                        let parsed = Self::parse_history(&rollout_path_buf, &item.thread_id);
+                        snap.has_message_or_path_updates(
+                            Self::SOURCE_TYPE,
+                            &item.thread_id,
+                            &parsed,
+                            item.project_path.as_deref(),
+                        )
+                    } else {
+                        let parsed = Self::parse_rollout(&rollout_path_buf);
+                        snap.has_message_or_path_updates(
+                            Self::SOURCE_TYPE,
+                            &item.thread_id,
+                            &parsed,
+                            item.project_path.as_deref(),
+                        )
+                    }
+                })
+                .unwrap_or(false);
+
             candidates.push(CodexThreadCandidate {
                 thread_id: item.thread_id.clone(),
                 title: if item.title.trim().is_empty() {
@@ -330,7 +372,8 @@ impl<'a> CodexRecoveryService<'a> {
                 },
                 rollout_path: rollout_path_buf.to_string_lossy().to_string(),
                 project_path: item.project_path,
-                exists_locally: imported_ids.contains(&item.thread_id),
+                exists_locally,
+                has_updates,
                 model: item.model,
                 observed_providers: sorted_provs,
                 updated_at: item.updated_at,
@@ -388,12 +431,14 @@ impl<'a> CodexRecoveryService<'a> {
                 titles.entry(id).or_insert(title);
             }
         }
-        let catalog_path = self.codex_home.join("sqlite").join("codex-dev.db");
-        if let Ok(rows) = Self::read_catalog_index(&catalog_path) {
-            for row in rows {
-                let title = clean_title(&row.title, &row.id);
-                if imported.contains(&row.id) && title != "Codex 会话" {
-                    titles.entry(row.id).or_insert(title);
+        for name in ["codex.db", "codex-dev.db"] {
+            let catalog_path = self.codex_home.join("sqlite").join(name);
+            if let Ok(rows) = Self::read_catalog_index(&catalog_path) {
+                for row in rows {
+                    let title = clean_title(&row.title, &row.id);
+                    if imported.contains(&row.id) && title != "Codex 会话" {
+                        titles.entry(row.id).or_insert(title);
+                    }
                 }
             }
         }

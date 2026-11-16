@@ -61,6 +61,45 @@ pub struct ResetSummary {
     pub folder_pin_count: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct ImportedSourceSnapshot {
+    pub conversation_id: String,
+    pub message_count: usize,
+    pub last_source_external_id: Option<String>,
+    pub last_content_len: usize,
+    pub project_path: Option<String>,
+}
+
+impl ImportedSourceSnapshot {
+    pub fn has_message_or_path_updates(
+        &self,
+        source_type: &str,
+        source_id: &str,
+        parsed_messages: &[ImportedMessagePayload],
+        project_path: Option<&str>,
+    ) -> bool {
+        if parsed_messages.is_empty() {
+            return false;
+        }
+        if parsed_messages.len() > self.message_count {
+            return true;
+        }
+        if let Some(last) = parsed_messages.last() {
+            let expected_ext = format!("{}:{}:{}", source_type, source_id, last.external_id);
+            if self.last_source_external_id.as_deref() != Some(expected_ext.as_str()) {
+                return true;
+            }
+            if last.content.len() != self.last_content_len {
+                return true;
+            }
+        }
+        if self.project_path.is_none() && project_path.is_some() {
+            return true;
+        }
+        false
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FolderPin {
     pub source: String,
@@ -483,6 +522,17 @@ impl<'a> Repository<'a> {
         Ok(msgs)
     }
 
+    pub fn load_active_path_or_chronological(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<CanonicalMessage>> {
+        match self.load_active_path(conversation_id) {
+            Ok(path) => Ok(path),
+            Err(rusqlite::Error::InvalidQuery) => self.list_messages(conversation_id),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn search_conversations(
         &self,
         query: &str,
@@ -652,6 +702,86 @@ impl<'a> Repository<'a> {
         Ok(res)
     }
 
+    pub fn imported_source_snapshots(
+        &self,
+        source_type: &str,
+    ) -> Result<HashMap<String, ImportedSourceSnapshot>> {
+        let conn = self.db.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT
+                c.id,
+                c.project_path,
+                c.active_leaf_message_id,
+                m.id,
+                m.source_external_id,
+                LENGTH(CAST(m.content AS BLOB))
+             FROM messages m
+             JOIN conversations c ON c.id = m.conversation_id
+             WHERE m.source_type = ?1 AND m.source_external_id IS NOT NULL
+             ORDER BY m.conversation_id, m.sequence_no ASC",
+        )?;
+        let rows = stmt.query_map([source_type], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, usize>(5)?,
+            ))
+        })?;
+
+        let mut map: HashMap<String, ImportedSourceSnapshot> = HashMap::new();
+        for r in rows {
+            let (conv_id, project_path, active_leaf_id, msg_id, src_ext_id, content_len) = r?;
+            let Some(source_id) = source_id_from_external_id(source_type, &src_ext_id) else {
+                continue;
+            };
+            let entry = map.entry(source_id).or_insert_with(|| ImportedSourceSnapshot {
+                conversation_id: conv_id,
+                message_count: 0,
+                last_source_external_id: None,
+                last_content_len: 0,
+                project_path,
+            });
+            entry.message_count += 1;
+            let is_leaf = match &active_leaf_id {
+                Some(leaf_id) => leaf_id == &msg_id,
+                None => true,
+            };
+            if is_leaf || entry.last_source_external_id.is_none() {
+                entry.last_source_external_id = Some(src_ext_id);
+                entry.last_content_len = content_len;
+            }
+        }
+        Ok(map)
+    }
+
+    pub fn user_edited_titles_for_source(&self, source_type: &str) -> Result<HashMap<String, String>> {
+        let conn = self.db.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT c.title, m.source_external_id
+             FROM conversations c
+             JOIN messages m ON m.conversation_id = c.id
+             WHERE c.title_user_edited = 1
+               AND m.source_type = ?1
+               AND m.source_external_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([source_type], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = HashMap::new();
+        for r in rows {
+            let (title, ext_id) = r?;
+            if let Some(source_id) = source_id_from_external_id(source_type, &ext_id) {
+                if !title.trim().is_empty() {
+                    out.insert(source_id, title);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn remember_recovery_exclusions(
         &self,
         source_type: &str,
@@ -685,7 +815,6 @@ impl<'a> Repository<'a> {
         let mut connection = self.db.lock_conn();
         let transaction = connection.transaction()?;
         let conn = &transaction;
-        let now = now_iso();
         let mut updated_count = 0;
 
         for (source_id, source_title) in titles {
@@ -726,14 +855,12 @@ impl<'a> Repository<'a> {
                     let title_changed = visible_title != current_title;
                     let rows = conn.execute(
                         "UPDATE conversations
-                         SET title = ?1, source_title = ?2, title_user_edited = ?3,
-                             updated_at = CASE WHEN title <> ?1 THEN ?4 ELSE updated_at END
-                         WHERE id = ?5",
+                         SET title = ?1, source_title = ?2, title_user_edited = ?3
+                         WHERE id = ?4",
                         params![
                             visible_title,
                             source_title,
                             user_edited as i64,
-                            now,
                             conv_id
                         ],
                     )?;
@@ -900,6 +1027,7 @@ impl<'a> Repository<'a> {
         )?;
 
         let mut inserted_count = 0;
+        let mut updated_msg_count = 0;
         let mut active_leaf_db_id = None;
 
         for (msg, time) in messages.iter().zip(&message_times) {
@@ -909,11 +1037,14 @@ impl<'a> Repository<'a> {
             );
 
             let db_msg_id = if let Some(existing_id) = existing_ext_ids.get(&formatted_ext_id) {
-                conn.execute(
+                let rows = conn.execute(
                     "UPDATE messages SET content = ?1, role = ?2, updated_at = ?3
                      WHERE id = ?4 AND (content <> ?1 OR role <> ?2)",
                     params![msg.content, msg.role, now, existing_id],
                 )?;
+                if rows > 0 {
+                    updated_msg_count += rows;
+                }
                 existing_id.clone()
             } else {
                 current_seq += 1;
@@ -982,9 +1113,10 @@ impl<'a> Repository<'a> {
                 params![leaf_id, conv_id],
             )?;
         }
-        // Only new messages move a conversation; re-scanning unchanged sources must
+        let changed_msg_count = inserted_count + updated_msg_count;
+        // Only new or updated messages move a conversation; re-scanning unchanged sources must
         // not reorder the list.
-        if !created && inserted_count > 0 {
+        if !created && changed_msg_count > 0 {
             let newest = latest.clone().unwrap_or_else(|| now.clone());
             conn.execute(
                 "UPDATE conversations SET updated_at = ?1 WHERE id = ?2 AND updated_at < ?1",
@@ -993,7 +1125,7 @@ impl<'a> Repository<'a> {
         }
 
         transaction.commit()?;
-        Ok((conv_id, inserted_count, created, title_updated))
+        Ok((conv_id, changed_msg_count, created, title_updated))
     }
 
     pub fn recover_stale_requests(&self) -> Result<(usize, usize)> {

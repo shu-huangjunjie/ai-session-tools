@@ -261,12 +261,12 @@ export const McpManager: React.FC<McpManagerProps> = ({ onToast }) => {
         }
       >
         <div className="relative">
-          <Search size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#86868b]" />
+          <Search size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder={m.search}
-            className="w-56 bg-black/[0.045] dark:bg-white/[0.07] pl-8 pr-3 py-1.5 rounded-lg border border-transparent focus:border-[#0071e3] focus:outline-none placeholder-[#86868b]"
+            className="w-56 bg-slate-100/90 dark:bg-[#101725] text-slate-800 dark:text-slate-100 pl-8 pr-3 py-1.5 rounded-lg border border-slate-200/85 dark:border-slate-700/75 focus:border-blue-500 focus:bg-white dark:focus:bg-[#162033] focus:outline-none placeholder-slate-400 transition-all"
           />
         </div>
         <Button
@@ -291,14 +291,14 @@ export const McpManager: React.FC<McpManagerProps> = ({ onToast }) => {
       </PageHeader>
 
       <div className="flex-1 flex min-h-0">
-        <div className="flex-1 min-w-0 flex flex-col bg-white dark:bg-[#121214] border-r border-black/[0.06] dark:border-white/[0.08]">
+        <div className="flex-1 min-w-0 flex flex-col bg-white/75 dark:bg-[#121a2a]/75 backdrop-blur-md border-r border-slate-200/75 dark:border-slate-800/80">
           <div className="flex-1 overflow-y-auto">
             <table className="w-full border-separate border-spacing-0" role="grid">
               <thead>
-                <tr className="text-[11px] text-[#86868b]">
-                  <th className="sticky top-0 z-10 bg-white dark:bg-[#121214] text-left font-medium px-4 py-2.5 border-b border-black/[0.06] dark:border-white/[0.08]">{m.name}</th>
+                <tr className="text-[11px] text-slate-500 dark:text-slate-400">
+                  <th className="sticky top-0 z-10 bg-slate-50/88 dark:bg-[#101725]/88 backdrop-blur-md text-left font-semibold px-4 py-2.5 border-b border-slate-200/80 dark:border-slate-800/85">{m.name}</th>
                   {CLIENTS.map((c) => (
-                    <th key={c} className="sticky top-0 z-10 bg-white dark:bg-[#121214] text-left font-medium px-4 py-2 w-[120px] border-b border-black/[0.06] dark:border-white/[0.08]">
+                    <th key={c} className="sticky top-0 z-10 bg-slate-50/88 dark:bg-[#101725]/88 backdrop-blur-md text-left font-semibold px-4 py-2 w-[120px] border-b border-slate-200/80 dark:border-slate-800/85">
                       <div className="flex flex-col items-start gap-0.5">
                         <span>{CLIENT_LABEL[c]}</span>
                         <button
@@ -307,7 +307,7 @@ export const McpManager: React.FC<McpManagerProps> = ({ onToast }) => {
                           disabled={busy || offIn(c).length === 0}
                           title={interpolate(m.enableAllTooltip, { client: CLIENT_LABEL[c], count: offIn(c).length })}
                           aria-label={interpolate(m.enableAllIn, { client: CLIENT_LABEL[c] })}
-                          className="text-[11px] font-normal text-[#0071e3] dark:text-[#2997ff] hover:underline disabled:text-[#86868b] disabled:opacity-50 disabled:no-underline disabled:cursor-default"
+                          className="text-[11px] font-normal text-blue-600 dark:text-sky-400 hover:underline disabled:text-slate-400 disabled:opacity-50 disabled:no-underline disabled:cursor-default"
                         >
                           {m.enableAll}
                         </button>
@@ -319,15 +319,15 @@ export const McpManager: React.FC<McpManagerProps> = ({ onToast }) => {
               <tbody>
                 {visibleGroups.length === 0 && (
                   <tr>
-                    <td colSpan={CLIENTS.length + 1} className="text-center text-[#86868b] py-10">{query ? m.noMatch : m.empty}</td>
+                    <td colSpan={CLIENTS.length + 1} className="text-center text-slate-400 py-10">{query ? m.noMatch : m.empty}</td>
                   </tr>
                 )}
                 {visibleGroups.map((g) => (
                   <tr
                     key={g.key}
-                    className={selected?.key === g.key ? 'bg-[#0071e3]/[0.05] dark:bg-[#2997ff]/10' : 'hover:bg-black/[0.02] dark:hover:bg-white/[0.03]'}
+                    className={selected?.key === g.key ? 'bg-blue-50/80 dark:bg-blue-500/12' : 'hover:bg-slate-50/80 dark:hover:bg-white/[0.03]'}
                   >
-                    <td className="px-4 py-2.5 border-b border-black/[0.05] dark:border-white/[0.06] max-w-0">
+                    <td className="px-4 py-2.5 border-b border-slate-100 dark:border-slate-800/80 max-w-0">
                       <button
                         type="button"
                         onClick={() => {
@@ -336,14 +336,14 @@ export const McpManager: React.FC<McpManagerProps> = ({ onToast }) => {
                         }}
                         className="text-left w-full min-w-0"
                       >
-                        <div className={`font-semibold text-[13px] text-[#1d1d1f] dark:text-white ${isOff(g) ? 'opacity-60' : ''}`}>{g.name}</div>
-                        <div className="mt-0.5 font-mono text-[11px] text-[#86868b] truncate" title={serverSummary(g.primary)}>
+                        <div className={`font-semibold text-[13px] text-slate-900 dark:text-white ${isOff(g) ? 'opacity-60' : ''}`}>{g.name}</div>
+                        <div className="mt-0.5 font-mono text-[11px] text-slate-500 dark:text-slate-400 truncate" title={serverSummary(g.primary)}>
                           {serverSummary(g.primary)}
                         </div>
                       </button>
                     </td>
                     {CLIENTS.map((client) => (
-                      <td key={client} className="px-4 py-2.5 border-b border-black/[0.05] dark:border-white/[0.06]">
+                      <td key={client} className="px-4 py-2.5 border-b border-slate-100 dark:border-slate-800/80">
                         <div className="flex items-center gap-1.5">
                           <Switch
                             checked={isOn(g, client)}
@@ -352,7 +352,7 @@ export const McpManager: React.FC<McpManagerProps> = ({ onToast }) => {
                             title={switchTitle(g, client)}
                             onChange={() => toggleClient(g, client)}
                           />
-                          {g.entries[client]?.read_only && <Lock size={11} className="text-[#af52de]" aria-label={m.readOnly} />}
+                          {g.entries[client]?.read_only && <Lock size={11} className="text-purple-500" aria-label={m.readOnly} />}
                         </div>
                       </td>
                     ))}
@@ -361,7 +361,7 @@ export const McpManager: React.FC<McpManagerProps> = ({ onToast }) => {
               </tbody>
             </table>
           </div>
-          <div className="px-4 py-2.5 border-t border-black/[0.06] dark:border-white/[0.08] text-[11px] text-[#86868b] flex flex-col gap-1">
+          <div className="px-4 py-2.5 border-t border-slate-200/85 dark:border-slate-800/85 bg-slate-50/60 dark:bg-[#111827]/60 text-[11px] text-slate-500 dark:text-slate-400 flex flex-col gap-1">
             {locations.map((l) => (
               <div key={l.client} className="flex items-center gap-1.5 min-w-0">
                 <span className="font-semibold shrink-0">{CLIENT_LABEL[l.client]}</span>
@@ -374,7 +374,7 @@ export const McpManager: React.FC<McpManagerProps> = ({ onToast }) => {
         </div>
 
         {/* Detail or form */}
-        <div className="w-[420px] flex-shrink-0 overflow-y-auto p-6 select-text">
+        <div className="w-[420px] flex-shrink-0 overflow-y-auto p-6 bg-slate-50/55 dark:bg-[#0d1320]/65 backdrop-blur-sm select-text">
           {editing ? (
             <McpServerForm
               key={editing.group ? editing.group.key : 'new'}

@@ -5,8 +5,15 @@
     <link rel="icon" type="image/png" href="/context-vault.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Context Vault · 本地会话控制台</title>
+    <script>
+      try {
+        if (localStorage.getItem('cv_theme_v2') === 'dark') {
+          document.documentElement.classList.add('dark');
+        }
+      } catch (_) {}
+    </script>
   </head>
-  <body class="bg-[#06101c] text-[#dceaf6] select-none overflow-hidden antialiased">
+  <body class="bg-[#f4f6fa] dark:bg-[#0f141f] text-[#0f172a] dark:text-[#e2e8f0] select-none overflow-hidden antialiased">
     <div id="root" class="w-screen h-screen flex flex-col"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

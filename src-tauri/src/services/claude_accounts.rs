@@ -9,19 +9,27 @@
 //! （Anthropic 的 refresh token 用一次就作废），其他账号过期时用它的 refresh token 换新；
 //! 刷新用的 client id 在运行时从已安装的 Claude Code 中读取。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
-use super::account_store::{self, AccountView, AccountsState, CurrentLogin, Quota, QuotaState, QuotaWindow};
+use super::account_store::{self, AccountMeta, AccountView, AccountsState, CurrentLogin, Quota, QuotaState, QuotaWindow};
 use super::win_http::{self, HttpFn};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
+const AUTH_URL: &str = "https://claude.com/cai/oauth/authorize";
+const MANUAL_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const DEFAULT_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const OAUTH_SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
+const LOGIN_TIMEOUT_SECS: u64 = 600;
 const STORE_FILE: &str = "claude.json";
 const EXPIRY_MARGIN_MS: i64 = 120_000;
 /// `settings.json` 的 `env` 中属于中转供应商的键；切换供应商时整组替换。
@@ -63,6 +71,8 @@ struct StoredAccount {
     added_at: String,
     #[serde(default)]
     last_used_at: Option<String>,
+    #[serde(default, flatten)]
+    meta: AccountMeta,
     #[serde(flatten)]
     quota: QuotaState,
 }
@@ -85,13 +95,27 @@ struct Store {
 }
 
 /// 新增或编辑中转供应商。`token` 为空表示编辑时保留原值。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ProviderInput {
     pub id: Option<String>,
     pub name: String,
     pub base_url: String,
     pub token: Option<String>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub auth_field: Option<String>,
+    #[serde(default)]
+    pub haiku_model: Option<String>,
+    #[serde(default)]
+    pub sonnet_model: Option<String>,
+    #[serde(default)]
+    pub opus_model: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct ClaudeTokenImport {
+    pub ids: Vec<String>,
+    pub failures: Vec<String>,
 }
 
 pub struct ClaudeAccountManager {
@@ -223,6 +247,8 @@ impl ClaudeAccountManager {
             current_note: None,
             notes,
             accounts,
+            cockpit_import_count: 0,
+            cc_switch_available: false,
         })
     }
 
@@ -249,7 +275,114 @@ impl ClaudeAccountManager {
         self.upsert_oauth(oauth, account)
     }
 
+    /// 浏览器 PKCE OAuth 登录：打开 Anthropic 授权页并等待用户粘贴返回的 `code#state` 或完整回调链接。
+    pub fn login_oauth_pkce(
+        &self,
+        on_url: &dyn Fn(&str),
+        cancelled: &dyn Fn() -> bool,
+        take_manual: &dyn Fn() -> Option<String>,
+    ) -> Result<String, String> {
+        self.login_oauth_pkce_with(
+            on_url,
+            cancelled,
+            take_manual,
+            &win_http::request,
+            &|| find_claude_client_id().unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string()),
+            &account_store::open_in_browser,
+        )
+    }
+
+    fn login_oauth_pkce_with(
+        &self,
+        on_url: &dyn Fn(&str),
+        cancelled: &dyn Fn() -> bool,
+        take_manual: &dyn Fn() -> Option<String>,
+        http: &HttpFn<'_>,
+        client_id_fn: &dyn Fn() -> String,
+        open: &dyn Fn(&str),
+    ) -> Result<String, String> {
+        let client_id = client_id_fn();
+        let state = uuid::Uuid::new_v4().simple().to_string();
+        let (verifier, challenge) = account_store::pkce_pair();
+        let url = format!(
+            "{}?{}",
+            AUTH_URL,
+            account_store::form_encode(&[
+                ("code", "true"),
+                ("client_id", &client_id),
+                ("response_type", "code"),
+                ("redirect_uri", MANUAL_REDIRECT_URI),
+                ("scope", OAUTH_SCOPES),
+                ("code_challenge", &challenge),
+                ("code_challenge_method", "S256"),
+                ("state", &state),
+            ])
+        );
+        on_url(&url);
+        open(&url);
+
+        let started = Instant::now();
+        let code = loop {
+            if cancelled() {
+                return Err("已取消登录".into());
+            }
+            if started.elapsed() > Duration::from_secs(LOGIN_TIMEOUT_SECS) {
+                return Err("等待 Claude OAuth 授权超时，请重试".into());
+            }
+            if let Some(raw) = take_manual() {
+                if let Some(code) = account_store::extract_callback_code(&raw, Some(&state))? {
+                    break code;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+
+        let token_body = json!({
+            "grant_type": "authorization_code",
+            "code": code,
+            "state": state,
+            "client_id": client_id,
+            "redirect_uri": MANUAL_REDIRECT_URI,
+            "code_verifier": verifier,
+        })
+        .to_string();
+        let resp = http(
+            "POST",
+            TOKEN_URL,
+            &[("Content-Type", "application/json"), ("Accept", "application/json")],
+            Some(token_body.as_bytes()),
+        )?;
+        if !(200..300).contains(&resp.status) {
+            return Err(format!(
+                "换取 Claude OAuth token 失败（HTTP {} {}）",
+                resp.status,
+                account_store::error_code(&resp.body)
+            ));
+        }
+        let token_json: Value =
+            serde_json::from_slice(&resp.body).map_err(|_| "Claude token 响应不是 JSON".to_string())?;
+        let access_token = token_json
+            .get("access_token")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or("响应缺少 access_token")?;
+        let refresh_token = token_json
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let expires_in = token_json.get("expires_in").and_then(Value::as_i64).unwrap_or(3600);
+        let expires_at = Utc::now().timestamp_millis() + expires_in * 1000;
+
+        let profile = fetch_claude_profile(access_token, http)?;
+        let (creds, oauth_acc) = build_oauth_objects(&token_json, &profile, access_token, refresh_token, expires_at)?;
+        self.upsert_oauth(creds, oauth_acc)
+    }
+
     fn upsert_oauth(&self, creds: Value, account: Value) -> Result<String, String> {
+        self.upsert_oauth_with_meta(creds, account, AccountMeta::default())
+    }
+
+    fn upsert_oauth_with_meta(&self, creds: Value, account: Value, meta: AccountMeta) -> Result<String, String> {
         let key = oauth_key(&account).ok_or("账号信息不完整（缺少 accountUuid），请重新登录 Claude Code")?;
         let mut store = self.load()?;
         let expires = |c: &Value| c.get("expiresAt").and_then(Value::as_i64).unwrap_or(0);
@@ -259,6 +392,12 @@ impl ClaudeAccountManager {
                     existing.credentials = Some(creds);
                 }
                 existing.oauth_account = Some(account);
+                if !meta.tags.is_empty() {
+                    existing.meta.add_tags(meta.tags);
+                }
+                if existing.meta.note.is_none() && meta.note.is_some() {
+                    existing.meta.note = meta.note;
+                }
                 existing.id.clone()
             }
             None => {
@@ -272,6 +411,7 @@ impl ClaudeAccountManager {
                     env: Map::new(),
                     added_at: account_store::now(),
                     last_used_at: None,
+                    meta,
                     quota: QuotaState::default(),
                 });
                 id
@@ -282,6 +422,10 @@ impl ClaudeAccountManager {
     }
 
     fn upsert_provider_env(&self, name: Option<String>, env: Map<String, Value>) -> Result<String, String> {
+        self.upsert_provider_env_with_meta(name, env, AccountMeta::default())
+    }
+
+    fn upsert_provider_env_with_meta(&self, name: Option<String>, env: Map<String, Value>, meta: AccountMeta) -> Result<String, String> {
         let key = provider_key(&env).ok_or("中转供应商缺少地址和 token")?;
         let mut store = self.load()?;
         let id = match store.accounts.iter_mut().find(|a| a.key().as_ref() == Some(&key)) {
@@ -289,6 +433,12 @@ impl ClaudeAccountManager {
                 existing.env = env;
                 if name.is_some() {
                     existing.name = name;
+                }
+                if !meta.tags.is_empty() {
+                    existing.meta.add_tags(meta.tags);
+                }
+                if existing.meta.note.is_none() && meta.note.is_some() {
+                    existing.meta.note = meta.note;
                 }
                 existing.id.clone()
             }
@@ -304,6 +454,7 @@ impl ClaudeAccountManager {
                     env,
                     added_at: account_store::now(),
                     last_used_at: None,
+                    meta,
                     quota: QuotaState::default(),
                 });
                 id
@@ -327,17 +478,44 @@ impl ClaudeAccountManager {
         };
         let mut env = existing.map(|i| store.accounts[i].env.clone()).unwrap_or_default();
         env.insert("ANTHROPIC_BASE_URL".into(), Value::String(base_url));
+
+        let use_api_key = input.auth_field.as_deref() == Some("ANTHROPIC_API_KEY");
         if let Some(token) = input.token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
-            env.remove("ANTHROPIC_API_KEY");
-            env.insert("ANTHROPIC_AUTH_TOKEN".into(), Value::String(token));
+            if use_api_key {
+                env.remove("ANTHROPIC_AUTH_TOKEN");
+                env.insert("ANTHROPIC_API_KEY".into(), Value::String(token));
+            } else {
+                env.remove("ANTHROPIC_API_KEY");
+                env.insert("ANTHROPIC_AUTH_TOKEN".into(), Value::String(token));
+            }
+        } else if input.auth_field.is_some() {
+            // 仅切换鉴权请求头字段、保留现有密钥值。
+            let prev = env
+                .get("ANTHROPIC_AUTH_TOKEN")
+                .or_else(|| env.get("ANTHROPIC_API_KEY"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let Some(val) = prev {
+                env.remove("ANTHROPIC_AUTH_TOKEN");
+                env.remove("ANTHROPIC_API_KEY");
+                let key_name = if use_api_key { "ANTHROPIC_API_KEY" } else { "ANTHROPIC_AUTH_TOKEN" };
+                env.insert(key_name.into(), Value::String(val));
+            }
         }
         if !env.contains_key("ANTHROPIC_AUTH_TOKEN") && !env.contains_key("ANTHROPIC_API_KEY") {
             return Err("请填写 token".into());
         }
-        match input.model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty()) {
-            Some(model) => env.insert("ANTHROPIC_MODEL".into(), Value::String(model)),
-            None => env.remove("ANTHROPIC_MODEL"),
+        let mut set_opt = |env_key: &str, val: Option<String>| {
+            match val.map(|m| m.trim().to_string()).filter(|m| !m.is_empty()) {
+                Some(m) => { env.insert(env_key.into(), Value::String(m)); }
+                None => { env.remove(env_key); }
+            }
         };
+        set_opt("ANTHROPIC_MODEL", input.model);
+        set_opt("ANTHROPIC_DEFAULT_HAIKU_MODEL", input.haiku_model);
+        set_opt("ANTHROPIC_DEFAULT_SONNET_MODEL", input.sonnet_model);
+        set_opt("ANTHROPIC_DEFAULT_OPUS_MODEL", input.opus_model);
+
         let key = provider_key(&env);
         if store.accounts.iter().enumerate().any(|(i, a)| Some(i) != existing && a.key() == key) {
             return Err("已有相同地址和 token 的供应商".into());
@@ -362,6 +540,7 @@ impl ClaudeAccountManager {
                     env,
                     added_at: account_store::now(),
                     last_used_at: None,
+                    meta: AccountMeta::default(),
                     quota: QuotaState::default(),
                 });
                 id
@@ -369,6 +548,150 @@ impl ClaudeAccountManager {
         };
         self.save(&store)?;
         Ok(id)
+    }
+
+    pub fn import_tokens(&self, text: &str) -> Result<ClaudeTokenImport, String> {
+        self.import_tokens_with(text, &win_http::request)
+    }
+
+    fn import_tokens_with(&self, text: &str, http: &HttpFn<'_>) -> Result<ClaudeTokenImport, String> {
+        let entries = parse_claude_import_entries(text);
+        if entries.is_empty() {
+            return Err("未识别出有效的 Claude .credentials.json、OAuth token 或供应商 JSON".into());
+        }
+        let mut result = ClaudeTokenImport::default();
+        for entry in entries {
+            let label = entry.label.clone();
+            let outcome = match entry.kind {
+                ClaudeImportKind::OauthFull { creds, oauth_account } => {
+                    self.upsert_oauth_with_meta(creds, oauth_account, entry.meta)
+                }
+                ClaudeImportKind::AccessToken { access_token, refresh_token, expires_at } => {
+                    fetch_claude_profile(&access_token, http).and_then(|profile| {
+                        let (creds, oauth_acc) = build_oauth_objects(
+                            &Value::Null,
+                            &profile,
+                            &access_token,
+                            refresh_token.as_deref().unwrap_or(""),
+                            expires_at.unwrap_or_else(|| Utc::now().timestamp_millis() + 3_600_000),
+                        )?;
+                        self.upsert_oauth_with_meta(creds, oauth_acc, entry.meta)
+                    })
+                }
+                ClaudeImportKind::Provider { name, env } => {
+                    self.upsert_provider_env_with_meta(name, env, entry.meta)
+                }
+            };
+            match outcome {
+                Ok(id) => result.ids.push(id),
+                Err(e) => result.failures.push(format!("{}：{}", label, e)),
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn count_cockpit_tools_in(&self, dirs: &[PathBuf]) -> usize {
+        let store = self.load().unwrap_or_default();
+        collect_cockpit_claude_entries(dirs)
+            .into_iter()
+            .filter(|e| !is_claude_entry_saved(&store, e))
+            .count()
+    }
+
+    pub fn import_cockpit_tools_from(&self, dirs: &[PathBuf]) -> Result<ClaudeTokenImport, String> {
+        self.import_cockpit_tools_with(dirs, &win_http::request)
+    }
+
+    fn import_cockpit_tools_with(&self, dirs: &[PathBuf], http: &HttpFn<'_>) -> Result<ClaudeTokenImport, String> {
+        let entries = collect_cockpit_claude_entries(dirs);
+        if entries.is_empty() {
+            return Err("未在本机 Cockpit Tools 目录中找到可导入的 Claude 账号".into());
+        }
+        let mut result = ClaudeTokenImport::default();
+        for entry in entries {
+            let label = entry.label.clone();
+            let outcome = match entry.kind {
+                ClaudeImportKind::OauthFull { creds, oauth_account } => {
+                    self.upsert_oauth_with_meta(creds, oauth_account, entry.meta)
+                }
+                ClaudeImportKind::AccessToken { access_token, refresh_token, expires_at } => {
+                    fetch_claude_profile(&access_token, http).and_then(|profile| {
+                        let (creds, oauth_acc) = build_oauth_objects(
+                            &Value::Null,
+                            &profile,
+                            &access_token,
+                            refresh_token.as_deref().unwrap_or(""),
+                            expires_at.unwrap_or_else(|| Utc::now().timestamp_millis() + 3_600_000),
+                        )?;
+                        self.upsert_oauth_with_meta(creds, oauth_acc, entry.meta)
+                    })
+                }
+                ClaudeImportKind::Provider { name, env } => {
+                    self.upsert_provider_env_with_meta(name, env, entry.meta)
+                }
+            };
+            match outcome {
+                Ok(id) => result.ids.push(id),
+                Err(e) => result.failures.push(format!("{}：{}", label, e)),
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn update_meta(&self, id: &str, tags: Option<Vec<String>>, note: Option<Option<String>>) -> Result<(), String> {
+        let mut store = self.load()?;
+        let target = store.accounts.iter_mut().find(|a| a.id == id).ok_or("账号不存在")?;
+        target.meta.update(tags, note);
+        self.save(&store)
+    }
+
+    pub fn batch_update_tags(&self, ids: &[String], add: &[String], remove: &[String]) -> Result<usize, String> {
+        let mut store = self.load()?;
+        let mut count = 0usize;
+        for account in &mut store.accounts {
+            if ids.iter().any(|id| id == &account.id) {
+                if !add.is_empty() {
+                    account.meta.add_tags(add.iter().cloned());
+                }
+                if !remove.is_empty() {
+                    account.meta.remove_tags(remove);
+                }
+                count += 1;
+            }
+        }
+        self.save(&store)?;
+        Ok(count)
+    }
+
+    pub fn batch_delete(&self, ids: &[String]) -> Result<usize, String> {
+        let mut store = self.load()?;
+        let before = store.accounts.len();
+        store.accounts.retain(|a| !ids.iter().any(|id| id == &a.id));
+        let deleted = before.saturating_sub(store.accounts.len());
+        self.save(&store)?;
+        Ok(deleted)
+    }
+
+    pub fn export_json(&self, ids: Option<&[String]>) -> Result<String, String> {
+        let store = self.load()?;
+        let selected: Vec<Value> = store
+            .accounts
+            .iter()
+            .filter(|a| ids.is_none_or(|list| list.iter().any(|id| id == &a.id)))
+            .map(|a| {
+                json!({
+                    "kind": match a.kind { Kind::Oauth => "oauth", Kind::Provider => "provider" },
+                    "name": a.name,
+                    "claudeAiOauth": a.credentials,
+                    "oauthAccount": a.oauth_account,
+                    "env": a.env,
+                    "tags": a.meta.tags,
+                    "note": a.meta.note,
+                    "added_at": a.added_at,
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&selected).map_err(|e| e.to_string())
     }
 
     /// 只读地导入 cc-switch 数据库里的 Claude 中转供应商，返回新增数量。
@@ -618,7 +941,7 @@ fn refresh(creds: &Value, http: &HttpFn<'_>, client_id: &dyn Fn() -> Option<Stri
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or("缺少 refresh token，请用这个账号重新登录")?;
-    let client_id = client_id().ok_or("没有在已安装的 Claude Code 中找到 OAuth 参数，无法刷新；请用这个账号重新登录")?;
+    let client_id = client_id().unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string());
     let body = json!({ "grant_type": "refresh_token", "refresh_token": token, "client_id": client_id }).to_string();
     let response = http("POST", TOKEN_URL, &[("Content-Type", "application/json"), ("Accept", "application/json")], Some(body.as_bytes()))?;
     if !(200..300).contains(&response.status) {
@@ -660,6 +983,361 @@ pub fn find_claude_client_id() -> Option<String> {
     })
 }
 
+fn fetch_claude_profile(access_token: &str, http: &HttpFn<'_>) -> Result<Value, String> {
+    let bearer = format!("Bearer {}", access_token);
+    let resp = http(
+        "GET",
+        PROFILE_URL,
+        &[
+            ("Authorization", bearer.as_str()),
+            ("anthropic-beta", OAUTH_BETA),
+            ("Accept", "application/json"),
+        ],
+        None,
+    )?;
+    if !(200..300).contains(&resp.status) {
+        return Err(format!(
+            "获取 Claude 账号信息失败（HTTP {} {}）",
+            resp.status,
+            account_store::error_code(&resp.body)
+        ));
+    }
+    serde_json::from_slice::<Value>(&resp.body).map_err(|_| "Claude profile 响应不是 JSON".to_string())
+}
+
+fn build_oauth_objects(
+    token_json: &Value,
+    profile: &Value,
+    access_token: &str,
+    refresh_token: &str,
+    expires_at: i64,
+) -> Result<(Value, Value), String> {
+    let acc_obj = profile.get("account").unwrap_or(profile);
+    let org_obj = profile.get("organization").unwrap_or(profile);
+    let uuid = acc_obj
+        .get("uuid")
+        .or_else(|| acc_obj.get("accountUuid"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("Claude 账号信息缺少 accountUuid")?;
+    let email = acc_obj
+        .get("email")
+        .or_else(|| acc_obj.get("emailAddress"))
+        .and_then(Value::as_str);
+    let name = acc_obj
+        .get("full_name")
+        .or_else(|| acc_obj.get("display_name"))
+        .or_else(|| acc_obj.get("displayName"))
+        .and_then(Value::as_str);
+    let org_uuid = org_obj
+        .get("uuid")
+        .or_else(|| org_obj.get("organizationUuid"))
+        .and_then(Value::as_str);
+    let org_name = org_obj
+        .get("name")
+        .or_else(|| org_obj.get("organizationName"))
+        .and_then(Value::as_str);
+    let sub_type = org_obj
+        .get("organization_type")
+        .or_else(|| token_json.get("subscription_type"))
+        .and_then(Value::as_str)
+        .map(|s| match s {
+            "claude_max" => "max",
+            "claude_pro" => "pro",
+            "claude_team" => "team",
+            other => other,
+        });
+
+    let mut creds = json!({
+        "accessToken": access_token,
+        "refreshToken": refresh_token,
+        "expiresAt": expires_at,
+    });
+    if let Some(sub) = sub_type {
+        creds["subscriptionType"] = Value::String(sub.to_string());
+    }
+    let oauth_acc = json!({
+        "accountUuid": uuid,
+        "emailAddress": email,
+        "displayName": name,
+        "organizationUuid": org_uuid,
+        "organizationName": org_name,
+    });
+    Ok((creds, oauth_acc))
+}
+
+enum ClaudeImportKind {
+    OauthFull { creds: Value, oauth_account: Value },
+    AccessToken { access_token: String, refresh_token: Option<String>, expires_at: Option<i64> },
+    Provider { name: Option<String>, env: Map<String, Value> },
+}
+
+struct ClaudeImportEntry {
+    label: String,
+    meta: AccountMeta,
+    kind: ClaudeImportKind,
+}
+
+fn entry_from_claude_json(item: &Value) -> Option<ClaudeImportEntry> {
+    let tags = item
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let note = item.get("note").or_else(|| item.get("notes")).and_then(Value::as_str).map(str::to_string);
+    let meta = AccountMeta::normalized(tags, note);
+
+    // 1) `.credentials.json` + `oauthAccount` 格式。
+    let creds = item.get("claudeAiOauth").or_else(|| item.get("credentials"));
+    let oauth_acc = item.get("oauthAccount").or_else(|| item.get("oauth_account"));
+    if let (Some(c), Some(a)) = (creds, oauth_acc) {
+        if oauth_key(a).is_some() && c.get("accessToken").and_then(Value::as_str).is_some() {
+            let label = a
+                .get("emailAddress")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| "Claude OAuth".into());
+            return Some(ClaudeImportEntry {
+                label,
+                meta,
+                kind: ClaudeImportKind::OauthFull {
+                    creds: c.clone(),
+                    oauth_account: a.clone(),
+                },
+            });
+        }
+    }
+
+    // 2) 中转 Provider（`env` 对象或直接 `base_url` + `token`/`api_key`）。
+    if let Some(env_obj) = item.get("env").and_then(Value::as_object) {
+        let picked: Map<String, Value> = PROVIDER_KEYS
+            .iter()
+            .filter_map(|k| env_obj.get(*k).filter(|v| v.as_str().is_some_and(|s| !s.is_empty())).map(|v| (k.to_string(), v.clone())))
+            .collect();
+        if provider_key(&picked).is_some() {
+            let name = item.get("name").and_then(Value::as_str).map(str::to_string);
+            let label = name
+                .clone()
+                .or_else(|| picked.get("ANTHROPIC_BASE_URL").and_then(Value::as_str).map(host_of))
+                .unwrap_or_else(|| "Claude 中转".into());
+            return Some(ClaudeImportEntry {
+                label,
+                meta,
+                kind: ClaudeImportKind::Provider { name, env: picked },
+            });
+        }
+    }
+    if let Some(base_url) = item.get("base_url").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+        if let Some(tok) = item
+            .get("token")
+            .or_else(|| item.get("api_key"))
+            .or_else(|| item.get("auth_token"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            let mut env = Map::new();
+            env.insert("ANTHROPIC_BASE_URL".into(), Value::String(base_url.trim().trim_end_matches('/').to_string()));
+            let key_name = if item.get("auth_field").and_then(Value::as_str) == Some("ANTHROPIC_API_KEY") {
+                "ANTHROPIC_API_KEY"
+            } else {
+                "ANTHROPIC_AUTH_TOKEN"
+            };
+            env.insert(key_name.into(), Value::String(tok.trim().to_string()));
+            for (in_k, env_k) in [
+                ("model", "ANTHROPIC_MODEL"),
+                ("haiku_model", "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+                ("sonnet_model", "ANTHROPIC_DEFAULT_SONNET_MODEL"),
+                ("opus_model", "ANTHROPIC_DEFAULT_OPUS_MODEL"),
+            ] {
+                if let Some(v) = item.get(in_k).and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                    env.insert(env_k.into(), Value::String(v.trim().to_string()));
+                }
+            }
+            let name = item.get("name").and_then(Value::as_str).map(str::to_string);
+            let label = name.clone().unwrap_or_else(|| host_of(base_url));
+            return Some(ClaudeImportEntry {
+                label,
+                meta,
+                kind: ClaudeImportKind::Provider { name, env },
+            });
+        }
+    }
+
+    // 3) Cockpit Tools 扁平化 / 手工 Token 格式（含 `access_token` / `refresh_token` / `account_uuid`）。
+    let tok_obj = creds.unwrap_or(item);
+    let access_token = tok_obj
+        .get("accessToken")
+        .or_else(|| tok_obj.get("access_token"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(at) = access_token {
+        let refresh_token = tok_obj
+            .get("refreshToken")
+            .or_else(|| tok_obj.get("refresh_token"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let expires_at = tok_obj
+            .get("expiresAt")
+            .or_else(|| tok_obj.get("expires_at"))
+            .and_then(Value::as_i64);
+        let email = item.get("email").or_else(|| item.get("emailAddress")).and_then(Value::as_str).map(str::to_string);
+        if let Some(uuid) = item
+            .get("account_uuid")
+            .or_else(|| item.get("accountUuid"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            let mut creds_v = json!({
+                "accessToken": at,
+                "refreshToken": refresh_token.unwrap_or_default(),
+                "expiresAt": expires_at.unwrap_or_else(|| Utc::now().timestamp_millis() + 3_600_000),
+            });
+            if let Some(sub) = item.get("subscription_type").or_else(|| tok_obj.get("subscriptionType")).and_then(Value::as_str) {
+                creds_v["subscriptionType"] = Value::String(sub.to_string());
+            }
+            let acc_v = json!({
+                "accountUuid": uuid,
+                "emailAddress": email,
+                "displayName": item.get("name").or_else(|| item.get("displayName")).and_then(Value::as_str),
+                "organizationName": item.get("organizationName").and_then(Value::as_str),
+            });
+            return Some(ClaudeImportEntry {
+                label: email.unwrap_or_else(|| "Claude OAuth".into()),
+                meta,
+                kind: ClaudeImportKind::OauthFull {
+                    creds: creds_v,
+                    oauth_account: acc_v,
+                },
+            });
+        }
+        return Some(ClaudeImportEntry {
+            label: email.unwrap_or_else(|| "Claude OAuth Token".into()),
+            meta,
+            kind: ClaudeImportKind::AccessToken {
+                access_token: at.to_string(),
+                refresh_token,
+                expires_at,
+            },
+        });
+    }
+
+    None
+}
+
+fn parse_claude_import_entries(text: &str) -> Vec<ClaudeImportEntry> {
+    let mut out = Vec::new();
+    let trimmed = text.trim().trim_start_matches('\u{feff}');
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        let items: Vec<&Value> = match &value {
+            Value::Array(a) => a.iter().collect(),
+            Value::Object(o) => match o.get("accounts") {
+                Some(Value::Array(a)) => a.iter().collect(),
+                _ => vec![&value],
+            },
+            _ => Vec::new(),
+        };
+        for item in items {
+            if let Some(entry) = entry_from_claude_json(item) {
+                out.push(entry);
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    let pattern = regex::Regex::new(r"sk-ant-oat[0-9A-Za-z_\-]{16,}").unwrap();
+    for m in pattern.find_iter(text) {
+        out.push(ClaudeImportEntry {
+            label: "Claude OAuth Token".into(),
+            meta: AccountMeta::default(),
+            kind: ClaudeImportKind::AccessToken {
+                access_token: m.as_str().to_string(),
+                refresh_token: None,
+                expires_at: None,
+            },
+        });
+    }
+    out
+}
+
+fn collect_cockpit_claude_entries(dirs: &[PathBuf]) -> Vec<ClaudeImportEntry> {
+    let mut out = Vec::new();
+    for root in dirs {
+        if !root.is_dir() {
+            continue;
+        }
+        let mut index_meta: HashMap<String, AccountMeta> = HashMap::new();
+        let index_path = root.join("claude_accounts.json");
+        if let Ok(text) = std::fs::read_to_string(&index_path) {
+            if let Ok(v) = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')) {
+                let arr = v.get("accounts").and_then(Value::as_array).cloned().or_else(|| v.as_array().cloned());
+                if let Some(items) = arr {
+                    for item in items {
+                        let tags = item
+                            .get("tags")
+                            .and_then(Value::as_array)
+                            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect::<Vec<_>>())
+                            .unwrap_or_default();
+                        let note = item.get("note").or_else(|| item.get("notes")).and_then(Value::as_str).map(str::to_string);
+                        let meta = AccountMeta::normalized(tags, note);
+                        if let Some(email) = item.get("email").and_then(Value::as_str) {
+                            index_meta.insert(email.to_lowercase(), meta.clone());
+                        }
+                        if let Some(mut entry) = entry_from_claude_json(&item) {
+                            if entry.meta.tags.is_empty() {
+                                entry.meta.tags = meta.tags;
+                            }
+                            if entry.meta.note.is_none() {
+                                entry.meta.note = meta.note;
+                            }
+                            out.push(entry);
+                        }
+                    }
+                }
+            }
+        }
+        let acc_dir = root.join("claude_accounts");
+        if let Ok(rd) = std::fs::read_dir(&acc_dir) {
+            for file in rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "json")) {
+                let Ok(text) = std::fs::read_to_string(&file) else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')) else { continue };
+                let Some(mut entry) = entry_from_claude_json(&v) else { continue };
+                if let Some(m) = index_meta.get(&entry.label.to_lowercase()) {
+                    if entry.meta.tags.is_empty() {
+                        entry.meta.tags = m.tags.clone();
+                    }
+                    if entry.meta.note.is_none() {
+                        entry.meta.note = m.note.clone();
+                    }
+                }
+                out.push(entry);
+            }
+        }
+    }
+    out
+}
+
+fn is_claude_entry_saved(store: &Store, entry: &ClaudeImportEntry) -> bool {
+    match &entry.kind {
+        ClaudeImportKind::OauthFull { oauth_account, .. } => {
+            let Some(k) = oauth_key(oauth_account) else { return false };
+            store.accounts.iter().any(|a| a.key().as_ref() == Some(&k))
+        }
+        ClaudeImportKind::AccessToken { access_token, .. } => store.accounts.iter().any(|a| {
+            a.credentials
+                .as_ref()
+                .and_then(|c| c.get("accessToken"))
+                .and_then(Value::as_str)
+                == Some(access_token.as_str())
+        }),
+        ClaudeImportKind::Provider { env, .. } => {
+            let Some(k) = provider_key(env) else { return false };
+            store.accounts.iter().any(|a| a.key().as_ref() == Some(&k))
+        }
+    }
+}
+
 fn view(a: &StoredAccount, is_current: bool) -> AccountView {
     match a.kind {
         Kind::Oauth => {
@@ -686,15 +1364,22 @@ fn view(a: &StoredAccount, is_current: bool) -> AccountView {
                 ..Default::default()
             }
             .with_quota(&a.quota)
+            .with_meta(&a.meta)
         }
         Kind::Provider => {
             let url = a.env.get("ANTHROPIC_BASE_URL").and_then(Value::as_str).unwrap_or("");
-            let model = a.env.get("ANTHROPIC_MODEL").and_then(Value::as_str);
+            let model = a.env.get("ANTHROPIC_MODEL").and_then(Value::as_str).map(str::to_string);
+            let auth_field = if a.env.contains_key("ANTHROPIC_API_KEY") && !a.env.contains_key("ANTHROPIC_AUTH_TOKEN") {
+                Some("ANTHROPIC_API_KEY".to_string())
+            } else {
+                Some("ANTHROPIC_AUTH_TOKEN".to_string())
+            };
+            let env_str = |k: &str| a.env.get(k).and_then(Value::as_str).map(str::to_string);
             AccountView {
                 id: a.id.clone(),
                 kind: Some("provider".into()),
                 name: a.name.clone(),
-                detail: Some(match model {
+                detail: Some(match &model {
                     Some(m) => format!("{} · {}", url, m),
                     None => url.to_string(),
                 }),
@@ -702,8 +1387,15 @@ fn view(a: &StoredAccount, is_current: bool) -> AccountView {
                 added_at: a.added_at.clone(),
                 last_used_at: a.last_used_at.clone(),
                 has_quota: false,
+                base_url: (!url.is_empty()).then(|| url.to_string()),
+                model,
+                auth_field,
+                haiku_model: env_str("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+                sonnet_model: env_str("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+                opus_model: env_str("ANTHROPIC_DEFAULT_OPUS_MODEL"),
                 ..Default::default()
             }
+            .with_meta(&a.meta)
         }
     }
 }
@@ -781,15 +1473,15 @@ mod tests {
         assert_eq!(state.notes.len(), 1);
         assert!(!state.accounts.iter().find(|a| a.id == id_oauth).unwrap().is_current);
 
-        let id_two = s.m.upsert_provider(ProviderInput { id: None, name: "Two".into(), base_url: "https://relay.two".into(), token: Some("sk-2".into()), model: None }).unwrap();
-        assert!(s.m.upsert_provider(ProviderInput { id: None, name: "Dup".into(), base_url: "https://relay.two".into(), token: Some("sk-2".into()), model: None }).is_err());
+        let id_two = s.m.upsert_provider(ProviderInput { id: None, name: "Two".into(), base_url: "https://relay.two".into(), token: Some("sk-2".into()), model: None, ..Default::default() }).unwrap();
+        assert!(s.m.upsert_provider(ProviderInput { id: None, name: "Dup".into(), base_url: "https://relay.two".into(), token: Some("sk-2".into()), model: None, ..Default::default() }).is_err());
         s.m.switch(&id_two).unwrap();
         let settings = s.read(".claude/settings.json");
         assert_eq!(settings["env"], json!({ "OTHER": "keep", "ANTHROPIC_BASE_URL": "https://relay.two", "ANTHROPIC_AUTH_TOKEN": "sk-2" }));
         assert_eq!(settings["model"], "opus");
 
         // 编辑时 token 留空表示保留原值。
-        s.m.upsert_provider(ProviderInput { id: Some(id_two.clone()), name: "Two!".into(), base_url: "https://relay.two".into(), token: None, model: Some("m2".into()) }).unwrap();
+        s.m.upsert_provider(ProviderInput { id: Some(id_two.clone()), name: "Two!".into(), base_url: "https://relay.two".into(), token: None, model: Some("m2".into()), ..Default::default() }).unwrap();
         let view = s.m.state().unwrap().accounts.into_iter().find(|a| a.id == id_two).unwrap();
         assert_eq!(view.name.as_deref(), Some("Two!"));
         assert_eq!(view.detail.as_deref(), Some("https://relay.two · m2"));
@@ -862,5 +1554,74 @@ mod tests {
         assert_eq!(s.read(".claude/.credentials.json")["claudeAiOauth"]["refreshToken"], "rt-at-cur");
         s.m.switch(&id_old).unwrap();
         assert_eq!(s.read(".claude/.credentials.json")["claudeAiOauth"]["refreshToken"], "rt-new");
+    }
+
+    #[test]
+    fn pkce_login_provider_mapping_and_cockpit_import_work() {
+        let s = Sandbox::new();
+        let manual = std::sync::Mutex::new(None::<String>);
+        let http = |_method: &str, url: &str, _headers: &[(&str, &str)], _body: Option<&[u8]>| {
+            let reply = |status: u16, body: Value| Ok(win_http::HttpResponse { status, body: body.to_string().into_bytes() });
+            if url == TOKEN_URL {
+                return reply(200, json!({ "access_token": "at-pkce", "refresh_token": "rt-pkce", "expires_in": 3600 }));
+            }
+            assert_eq!(url, PROFILE_URL);
+            reply(200, json!({
+                "account": { "uuid": "uuid-pkce", "email": "pkce@x.com", "full_name": "PKCE User" },
+                "organization": { "uuid": "org-1", "name": "Team X", "organization_type": "claude_max" }
+            }))
+        };
+        let pkce_id = s.m.login_oauth_pkce_with(
+            &|url| {
+                let state = url.split_once("state=").unwrap().1.split('&').next().unwrap();
+                *manual.lock().unwrap() = Some(format!("cl-code-123#{}", state));
+            },
+            &|| false,
+            &|| manual.lock().unwrap().take(),
+            &http,
+            &|| DEFAULT_CLIENT_ID.into(),
+            &|_| {},
+        ).unwrap();
+
+        // 扩展模型映射 + ANTHROPIC_API_KEY 字段切换。
+        let prov_id = s.m.upsert_provider(ProviderInput {
+            id: None,
+            name: "GLM Relay".into(),
+            base_url: "https://open.bigmodel.cn/api/anthropic".into(),
+            token: Some("sk-glm".into()),
+            model: Some("glm-4.7".into()),
+            auth_field: Some("ANTHROPIC_API_KEY".into()),
+            haiku_model: Some("glm-4.5-air".into()),
+            sonnet_model: Some("glm-4.7".into()),
+            opus_model: Some("glm-4.7".into()),
+        }).unwrap();
+        s.m.switch(&prov_id).unwrap();
+        let settings = s.read(".claude/settings.json");
+        assert_eq!(settings["env"]["ANTHROPIC_API_KEY"], "sk-glm");
+        assert_eq!(settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "glm-4.5-air");
+
+        // Cockpit Tools 导入 & 元数据/批量操作/导出。
+        let cockpit = s.root.join(".cockpit_tools");
+        fs::create_dir_all(cockpit.join("claude_accounts")).unwrap();
+        fs::write(
+            cockpit.join("claude_accounts/c1.json"),
+            json!({
+                "email": "cp@x.com",
+                "tags": ["Cockpit", "Claude"],
+                "note": "Cockpit 账号",
+                "claudeAiOauth": { "accessToken": "at-cp", "refreshToken": "rt-cp", "expiresAt": later() },
+                "oauthAccount": { "accountUuid": "uuid-cp", "emailAddress": "cp@x.com", "displayName": "CP" }
+            }).to_string(),
+        ).unwrap();
+        assert_eq!(s.m.count_cockpit_tools_in(&[cockpit.clone()]), 1);
+        let imp = s.m.import_cockpit_tools_with(&[cockpit.clone()], &http).unwrap();
+        assert_eq!(imp.ids.len(), 1);
+        assert_eq!(s.m.count_cockpit_tools_in(&[cockpit]), 0);
+
+        s.m.update_meta(&pkce_id, Some(vec!["主力".into()]), Some(Some("Max PKCE".into()))).unwrap();
+        s.m.batch_update_tags(&[pkce_id.clone()], &["Verified".into()], &[]).unwrap();
+        let exported = s.m.export_json(Some(&[pkce_id.clone(), prov_id.clone()])).unwrap();
+        assert!(exported.contains("pkce@x.com") && exported.contains("glm-4.5-air") && exported.contains("Verified"));
+        assert_eq!(s.m.batch_delete(&[pkce_id, prov_id]).unwrap(), 2);
     }
 }

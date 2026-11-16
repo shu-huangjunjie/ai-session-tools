@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useEffect, useLayoutEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import {
+  ArrowRightLeft,
   ChevronDown,
   ChevronRight,
   Folder,
@@ -15,8 +16,11 @@ import {
   Pin,
   PinOff,
   GripVertical,
+  Sparkles,
+  FolderPlus,
+  BookOpen,
 } from 'lucide-react';
-import { CodexVisibility, ConversationSummary, FolderPin } from '../types';
+import { CodexVisibility, ConversationSummary, FolderPin, PrismOpenMode } from '../types';
 import { folderPinKey } from '../utils/folderPins';
 import { extractProjectName } from '../utils/formatters';
 import { ItemGroup, groupByFolder, splitByCodexScope } from '../utils/codexScope';
@@ -58,6 +62,9 @@ interface SidebarProps {
   onBatchDelete: (selectedIds: string[]) => void;
   onOpenFolder: (path: string) => void;
   onOpenVSCode: (path: string) => void;
+  onOpenPrismProject?: (path: string, mode?: PrismOpenMode) => void;
+  onReadConversationInPrism?: (conversationId: string) => void;
+  onHandoff?: (conv: ConversationSummary) => void;
   onRename: (id: string, currentTitle: string) => void;
   onDelete: (id: string, title: string) => void;
   onSetPinned: (id: string, pinned: boolean) => void;
@@ -83,6 +90,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onBatchDelete,
   onOpenFolder,
   onOpenVSCode,
+  onOpenPrismProject,
+  onReadConversationInPrism,
+  onHandoff,
   onRename,
   onDelete,
   onSetPinned,
@@ -355,21 +365,27 @@ export const Sidebar: React.FC<SidebarProps> = ({
     : t.sidebar.emptyClaude;
 
   const selecting = publishSelection.size > 0;
-  // Checkboxes stay out of the way until hovered, or while a selection is in progress.
-  const checkboxClass = (checked: boolean, hoverGroup: string) =>
-    `rounded border-black/20 dark:border-white/20 w-3.5 h-3.5 flex-shrink-0 cursor-pointer accent-[#0071e3] transition-opacity ${
-      checked || selecting ? '' : `opacity-0 ${hoverGroup} focus:opacity-100`
-    }`;
+  // Unchecked checkboxes collapse to 0px width until hovered so titles get full sidebar space.
+  const checkboxClass = (checked: boolean, kind: 'folder' | 'conversation') => {
+    const base =
+      'rounded border-slate-300 dark:border-slate-600 h-3.5 flex-shrink-0 cursor-pointer accent-blue-600 transition-all';
+    if (checked || selecting) {
+      return `${base} w-3.5 opacity-100`;
+    }
+    return kind === 'folder'
+      ? `${base} w-0 overflow-hidden opacity-0 -mr-1.5 group-hover:w-3.5 group-hover:mr-0 group-hover:opacity-100 focus:w-3.5 focus:mr-0 focus:opacity-100`
+      : `${base} w-0 overflow-hidden opacity-0 -mr-2 group-hover/conversation:w-3.5 group-hover/conversation:mr-0 group-hover/conversation:opacity-100 focus:w-3.5 focus:mr-0 focus:opacity-100`;
+  };
 
   return (
     <aside
-      className="h-full bg-white dark:bg-[#0c0c0e] flex flex-col flex-shrink-0 select-none overflow-hidden transition-colors"
+      className="h-full bg-white/70 dark:bg-[#101726]/78 backdrop-blur-lg border-r border-slate-200/75 dark:border-slate-800/80 flex flex-col flex-shrink-0 select-none overflow-hidden transition-colors"
       style={{ width: `${width}px` }}
       onClick={closeContextMenu}
     >
       <div className="px-3 pt-3 pb-2">
         <div className="relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-[#86868b]" size={13} />
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 dark:text-slate-500" size={13} />
           <input
             id="sidebar-search"
             type="search"
@@ -377,22 +393,21 @@ export const Sidebar: React.FC<SidebarProps> = ({
             value={searchQuery}
             onChange={(e) => onSearchChange(e.target.value)}
             placeholder={t.sidebar.searchPlaceholder}
-            className="w-full bg-black/[0.045] dark:bg-white/[0.07] text-[#1d1d1f] dark:text-[#ededf0] text-xs pl-8 pr-14 py-2 rounded-lg border border-transparent focus:border-[#0071e3] focus:bg-white dark:focus:bg-white/[0.09] focus:outline-none placeholder-[#86868b] transition-all"
+            className="w-full bg-white/95 dark:bg-[#172135] text-slate-800 dark:text-slate-100 text-xs pl-8 pr-14 py-2 rounded-xl border border-slate-200/90 dark:border-slate-700/75 shadow-[0_1px_2px_rgba(15,23,42,0.04)] focus:border-blue-500 focus:ring-2 focus:ring-blue-500/15 focus:outline-none placeholder-slate-400 dark:placeholder-slate-500 transition-all"
           />
-          <kbd className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] text-[#86868b] font-mono px-1 rounded border border-black/[0.08] dark:border-white/[0.12] bg-white dark:bg-transparent select-none">
+          <kbd className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] text-slate-400 dark:text-slate-500 font-mono px-1.5 py-px rounded-md border border-slate-200/90 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/80 select-none">
             Ctrl K
           </kbd>
         </div>
       </div>
 
       {/* Project tree */}
-      <div ref={treeRef} className="flex-1 overflow-y-auto px-2 pb-2">
+      <div ref={treeRef} className="flex-1 overflow-y-auto px-2.5 pb-2">
         {treeRows.length === 0 ? (
-          <div className="text-center py-16 px-4 text-[#86868b] text-xs leading-relaxed">
+          <div className="text-center py-16 px-4 text-slate-400 dark:text-slate-500 text-xs leading-relaxed">
             {emptyText}
           </div>
         ) : (
-
           treeRows.map((row) => {
             if (row.kind === 'section') {
               const content = (
@@ -402,11 +417,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       (showHidden ? <ChevronDown size={11} /> : <ChevronRight size={11} />)}
                     {row.label}
                   </span>
-                  <span className="font-mono">{row.count}</span>
+                  <span className="font-mono text-[10.5px]">{row.count}</span>
                 </>
               );
               const className =
-                'w-full flex items-center justify-between px-2 pt-3 pb-1 text-[11px] font-medium text-[#86868b]';
+                'w-full flex items-center justify-between px-2 pt-3 pb-1 text-[11px] font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500';
               return row.collapsible ? (
                 <button
                   key={row.key}
@@ -414,7 +429,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   onClick={toggleHiddenExpanded}
                   aria-expanded={showHidden}
                   title={row.tooltip}
-                  className={`${className} hover:text-[#1d1d1f] dark:hover:text-[#ededf0] transition-colors`}
+                  className={`${className} hover:text-slate-700 dark:hover:text-slate-300 transition-colors`}
                 >
                   {content}
                 </button>
@@ -443,9 +458,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 className={`relative pt-1 ${draggingFolder === group.key ? 'opacity-40' : ''}`}
               >
                 {folderDrop?.key === group.key && (
-                  <div data-folder-drop-indicator className={`absolute left-2 right-1 h-0.5 rounded bg-[#0071e3] dark:bg-[#2997ff] pointer-events-none z-10 ${
-                    folderDrop.edge === 'before' ? 'top-0' : 'bottom-0'
-                  }`} />
+                  <div
+                    data-folder-drop-indicator
+                    className={`absolute left-2 right-1 h-0.5 rounded bg-blue-600 dark:bg-sky-400 pointer-events-none z-10 ${
+                      folderDrop.edge === 'before' ? 'top-0' : 'bottom-0'
+                    }`}
+                  />
                 )}
                 {/* Project Header Row */}
                 <div
@@ -455,7 +473,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     e.preventDefault();
                     setContextMenu({ kind: 'folder', x: e.clientX, y: e.clientY, path: folder });
                   }}
-                  className="group flex items-center gap-1.5 pl-2 pr-1.5 py-1.5 rounded-lg hover:bg-black/[0.035] dark:hover:bg-white/[0.05] transition-colors"
+                  className="group flex items-center gap-1.5 pl-1.5 pr-1.5 py-1.5 rounded-lg hover:bg-slate-200/55 dark:hover:bg-white/[0.05] transition-colors"
                 >
                   <input
                     type="checkbox"
@@ -464,7 +482,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       if (el) el.indeterminate = someChecked;
                     }}
                     onChange={() => onToggleProjectPublishSelection(convIds)}
-                    className={checkboxClass(allChecked || someChecked, 'group-hover:opacity-100')}
+                    className={checkboxClass(allChecked || someChecked, 'folder')}
                   />
 
                   <button
@@ -476,8 +494,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       suppressFolderClick.current = false;
                       if (!folder || !row.scope || event.button !== 0 || event.isPrimary === false) return;
                       closeContextMenu();
-                      dragRef.current = { key: group.key, scope: row.scope, source: activeSource,
-                        pointerId: event.pointerId, x: event.clientX, y: event.clientY, moved: false };
+                      dragRef.current = {
+                        key: group.key,
+                        scope: row.scope,
+                        source: activeSource,
+                        pointerId: event.pointerId,
+                        x: event.clientX,
+                        y: event.clientY,
+                        moved: false,
+                      };
                       event.currentTarget.setPointerCapture?.(event.pointerId);
                     }}
                     onPointerMove={handleFolderPointerMove}
@@ -491,9 +516,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       const siblings = treeRows.filter((item) => item.kind === 'group' && item.scope === row.scope && item.group.path);
                       const index = siblings.findIndex((item) => item.kind === 'group' && item.group.key === group.key);
                       const neighbor = siblings[index + (event.key === 'ArrowUp' ? -1 : 1)];
-                      if (neighbor?.kind === 'group') saveFolderMove(row.scope, group.key, {
-                        key: neighbor.group.key, edge: event.key === 'ArrowUp' ? 'before' : 'after',
-                      });
+                      if (neighbor?.kind === 'group') {
+                        saveFolderMove(row.scope, group.key, {
+                          key: neighbor.group.key,
+                          edge: event.key === 'ArrowUp' ? 'before' : 'after',
+                        });
+                      }
                     }}
                     onClick={(event) => {
                       if (suppressFolderClick.current && event.detail !== 0) {
@@ -502,70 +530,101 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       }
                       toggleCollapse(group.key);
                     }}
-                    className={`flex items-center gap-1.5 text-left min-w-0 flex-1 text-[12.5px] font-semibold text-[#1d1d1f] dark:text-[#f5f5f7] ${folder ? 'cursor-grab active:cursor-grabbing' : ''}`}
+                    className={`flex items-center gap-1.5 text-left min-w-0 flex-1 text-[12.5px] font-semibold text-slate-800 dark:text-slate-100 ${
+                      folder ? 'cursor-grab active:cursor-grabbing' : ''
+                    }`}
                   >
-                    {folder && <GripVertical size={11} aria-hidden="true" className="text-[#86868b] flex-shrink-0 opacity-40 group-hover:opacity-100" />}
+                    {folder && (
+                      <GripVertical
+                        size={11}
+                        aria-hidden="true"
+                        className="text-slate-400 flex-shrink-0 w-0 overflow-hidden opacity-0 group-hover:w-3 group-hover:opacity-80 transition-all"
+                      />
+                    )}
                     {isCollapsed ? (
-                      <ChevronRight size={13} className="text-[#86868b] flex-shrink-0" />
+                      <ChevronRight size={13} className="text-slate-400 dark:text-slate-500 flex-shrink-0" />
                     ) : (
-                      <ChevronDown size={13} className="text-[#86868b] flex-shrink-0" />
+                      <ChevronDown size={13} className="text-slate-400 dark:text-slate-500 flex-shrink-0" />
                     )}
                     {group.key === PINNED_KEY ? (
-                      <Pin size={13} className="text-[#0071e3] dark:text-[#2997ff] flex-shrink-0" />
+                      <Pin size={13} className="text-blue-600 dark:text-sky-400 flex-shrink-0" />
                     ) : group.key === CHATS_KEY ? (
-                      <MessageSquare size={13} className="text-[#86868b] flex-shrink-0" />
+                      <MessageSquare size={13} className="text-slate-400 flex-shrink-0" />
                     ) : isCollapsed ? (
-                      <Folder size={13} className="text-[#86868b] flex-shrink-0" />
+                      <Folder size={13.5} className="text-amber-500/80 dark:text-amber-400/75 flex-shrink-0" />
                     ) : (
-                      <FolderOpen size={13} className="text-[#86868b] flex-shrink-0" />
+                      <FolderOpen size={13.5} className="text-amber-500 dark:text-amber-400 flex-shrink-0" />
                     )}
                     <span className="truncate tracking-tight" title={folder ?? projectName}>
                       {projectName}
                     </span>
                   </button>
 
-                  {/* Folder shortcuts, then the count */}
+                  {/* Folder shortcuts collapse to 0px width until hovered so folder names never truncate prematurely */}
                   {folder && (
                     <div className="flex items-center flex-shrink-0">
-                      <button
-                        type="button"
-                        title={isFolderPinned ? t.sidebar.unpinFolder : t.sidebar.pinFolder}
-                        aria-pressed={isFolderPinned}
-                        onClick={() => onSetFolderPinned(folder, !isFolderPinned)}
-                        className={`p-1 rounded-md hover:bg-black/[0.06] dark:hover:bg-white/[0.1] transition-opacity ${
-                          isFolderPinned
-                            ? 'text-[#0071e3] dark:text-[#2997ff]'
-                            : 'text-[#86868b] opacity-0 group-hover:opacity-100 focus:opacity-100'
-                        }`}
-                      >
-                        <Pin size={12} />
-                      </button>
-                      <button
-                        onClick={() => onOpenFolder(folder)}
-                        title={t.sidebar.projectOpenFolder}
-                        className="p-1 rounded-md hover:bg-black/[0.06] dark:hover:bg-white/[0.1] text-[#86868b] hover:text-[#1d1d1f] dark:hover:text-white opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
-                      >
-                        <Folder size={12} />
-                      </button>
-                      <button
-                        onClick={() => onOpenVSCode(folder)}
-                        title={t.sidebar.projectOpenVSCode}
-                        className="p-1 rounded-md hover:bg-black/[0.06] dark:hover:bg-white/[0.1] text-[#86868b] hover:text-[#0071e3] dark:hover:text-[#2997ff] opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
-                      >
-                        <Code2 size={12} />
-                      </button>
+                      {isFolderPinned && (
+                        <button
+                          type="button"
+                          title={t.sidebar.unpinFolder}
+                          aria-pressed={true}
+                          onClick={() => onSetFolderPinned(folder, false)}
+                          className="p-1 rounded-md hover:bg-slate-200/80 dark:hover:bg-white/[0.1] text-blue-600 dark:text-sky-400 transition-colors"
+                        >
+                          <Pin size={12} />
+                        </button>
+                      )}
+                      <div className="flex items-center w-0 overflow-hidden opacity-0 group-hover:w-auto group-hover:opacity-100 focus-within:w-auto focus-within:opacity-100 transition-opacity">
+                        {!isFolderPinned && (
+                          <button
+                            type="button"
+                            title={t.sidebar.pinFolder}
+                            aria-pressed={false}
+                            onClick={() => onSetFolderPinned(folder, true)}
+                            className="p-1 rounded-md hover:bg-slate-200/80 dark:hover:bg-white/[0.1] text-slate-400 hover:text-blue-600 dark:hover:text-sky-400 transition-colors"
+                          >
+                            <Pin size={12} />
+                          </button>
+                        )}
+                        {onOpenPrismProject && (
+                          <button
+                            type="button"
+                            onClick={() => onOpenPrismProject(folder, 'new-workspace')}
+                            title={t.sidebar.projectOpenPrism}
+                            className="p-1 rounded-md hover:bg-slate-200/80 dark:hover:bg-white/[0.1] text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors"
+                          >
+                            <Sparkles size={12} />
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => onOpenFolder(folder)}
+                          title={t.sidebar.projectOpenFolder}
+                          className="p-1 rounded-md hover:bg-slate-200/80 dark:hover:bg-white/[0.1] text-slate-400 hover:text-slate-800 dark:hover:text-white transition-colors"
+                        >
+                          <Folder size={12} />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onOpenVSCode(folder)}
+                          title={t.sidebar.projectOpenVSCode}
+                          className="p-1 rounded-md hover:bg-slate-200/80 dark:hover:bg-white/[0.1] text-slate-400 hover:text-blue-600 dark:hover:text-sky-400 transition-colors"
+                        >
+                          <Code2 size={12} />
+                        </button>
+                      </div>
                     </div>
                   )}
-                  <span className="text-[11px] text-[#86868b] font-mono flex-shrink-0 min-w-[16px] text-right">
+                  <span className="text-[10.5px] text-slate-500 dark:text-slate-400 font-mono flex-shrink-0 px-1.5 py-px rounded-md bg-slate-200/65 dark:bg-slate-800/85 min-w-[18px] text-center">
                     {items.length}
                   </span>
                 </div>
 
                 {/* Conversation Children */}
                 {!isCollapsed && (
-                  <div className="space-y-px">
+                  <div className="space-y-0.5 mt-0.5">
                     {isFolderPinned && items.length === 0 && (
-                      <p className="pl-9 pr-2 py-1.5 text-[11px] text-[#86868b]">{t.sidebar.folderConversationsPinned}</p>
+                      <p className="pl-8 pr-2 py-1.5 text-[11px] text-slate-400">{t.sidebar.folderConversationsPinned}</p>
                     )}
                     {items.map((conv) => {
                       const isSelected = selectedId === conv.id;
@@ -576,18 +635,24 @@ export const Sidebar: React.FC<SidebarProps> = ({
                           key={conv.id}
                           onContextMenu={(e) => handleContextMenu(e, conv)}
                           onClick={() => onSelectConversation(conv.id)}
-                          className={`group/conversation flex items-center gap-2 pl-2 pr-1.5 py-[7px] ml-4 rounded-lg cursor-pointer transition-colors duration-150 text-[13px] ${
+                          className={`group/conversation relative flex items-center gap-2 pl-2.5 pr-1.5 py-[7px] ml-3.5 rounded-lg cursor-pointer transition-all duration-150 text-[12.5px] ${
                             isSelected
-                              ? 'bg-[#0071e3]/[0.09] dark:bg-[#2997ff]/15 text-[#0071e3] dark:text-[#64b5ff] font-medium'
-                              : 'text-[#3a3a3c] dark:text-[#c7c7cc] hover:bg-black/[0.035] dark:hover:bg-white/[0.05] hover:text-[#1d1d1f] dark:hover:text-white'
+                              ? 'bg-blue-50/95 dark:bg-blue-500/[0.16] text-blue-700 dark:text-sky-300 font-medium ring-1 ring-inset ring-blue-200/85 dark:ring-blue-400/25 shadow-[0_1px_2px_rgba(37,99,235,0.06)]'
+                              : 'text-slate-600 dark:text-slate-300 hover:bg-slate-200/55 dark:hover:bg-white/[0.05] hover:text-slate-900 dark:hover:text-white'
                           }`}
                         >
+                          {isSelected && (
+                            <span
+                              aria-hidden="true"
+                              className="absolute left-0 top-1.5 bottom-1.5 w-[3px] rounded-r-full bg-blue-600 dark:bg-sky-400"
+                            />
+                          )}
                           <input
                             type="checkbox"
                             checked={isChecked}
                             onClick={(e) => e.stopPropagation()}
                             onChange={() => onTogglePublishSelection(conv.id)}
-                            className={checkboxClass(isChecked, 'group-hover/conversation:opacity-100')}
+                            className={checkboxClass(isChecked, 'conversation')}
                           />
 
                           <span className="truncate flex-1 tracking-tight" title={conv.title}>
@@ -602,15 +667,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
                               e.stopPropagation();
                               onSetPinned(conv.id, !conv.pinned_at);
                             }}
-                            className={`p-0.5 rounded-md hover:bg-black/[0.06] dark:hover:bg-white/[0.1] transition-opacity flex-shrink-0 ${
+                            className={`rounded-md hover:bg-slate-200/80 dark:hover:bg-white/[0.1] transition-all flex-shrink-0 ${
                               conv.pinned_at
-                                ? 'text-[#0071e3] dark:text-[#2997ff]'
-                                : 'text-[#86868b] opacity-0 group-hover/conversation:opacity-100 focus:opacity-100'
+                                ? 'p-0.5 text-blue-600 dark:text-sky-400 opacity-100'
+                                : 'w-0 overflow-hidden opacity-0 p-0 group-hover/conversation:w-auto group-hover/conversation:p-0.5 group-hover/conversation:opacity-100 focus:w-auto focus:p-0.5 focus:opacity-100 text-slate-400 hover:text-blue-600 dark:hover:text-sky-400'
                             }`}
                           >
                             <Pin size={12} />
                           </button>
-                          <span className="text-[11px] text-[#86868b] flex-shrink-0 font-mono font-normal min-w-[16px] text-right">
+                          <span
+                            className={`text-[10.5px] flex-shrink-0 font-mono font-normal min-w-[16px] text-right ${
+                              isSelected ? 'text-blue-600/80 dark:text-sky-300/80' : 'text-slate-400 dark:text-slate-500'
+                            }`}
+                          >
                             {conv.message_count}
                           </span>
                         </div>
@@ -626,7 +695,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
       {/* Batch actions for the checked conversations */}
       {selecting && (
-        <div className="m-2 mt-0 pl-3 pr-1.5 py-1.5 rounded-xl bg-[#1d1d1f] dark:bg-[#2c2c2e] text-white flex items-center gap-1.5 text-xs shadow-lg animate-in fade-in slide-in-from-bottom-1 duration-150">
+        <div className="m-2.5 mt-0 pl-3 pr-1.5 py-2 rounded-xl bg-slate-900 dark:bg-[#1e293b] border border-slate-800 dark:border-slate-700 text-white flex items-center gap-1.5 text-xs shadow-lg animate-in fade-in slide-in-from-bottom-1 duration-150">
           <span className="flex-1 font-medium truncate">
             {interpolate(t.sidebar.selectedCount, { count: publishSelection.size })}
           </span>
@@ -634,7 +703,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             type="button"
             onClick={() => onBatchExportMarkdown(Array.from(publishSelection))}
             title={t.sidebar.batchExportMdTooltip}
-            className="flex items-center gap-1 px-2 py-1 rounded-md border border-white/20 hover:bg-white/10 transition-colors"
+            className="flex items-center gap-1 px-2 py-1 rounded-lg border border-white/15 hover:bg-white/10 transition-colors"
           >
             <FileDown size={12} />
             {t.sidebar.batchExportMd}
@@ -643,7 +712,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             type="button"
             onClick={() => onBatchDelete(Array.from(publishSelection))}
             title={t.sidebar.batchDeleteTooltip}
-            className="flex items-center gap-1 px-2 py-1 rounded-md border border-white/20 hover:bg-[#ff453a]/30 transition-colors"
+            className="flex items-center gap-1 px-2 py-1 rounded-lg border border-rose-400/30 text-rose-300 hover:bg-rose-500/25 transition-colors"
           >
             <Trash2 size={12} />
             {t.common.delete}
@@ -653,7 +722,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onClick={onClearSelection}
             title={t.sidebar.clearSelectionTooltip}
             aria-label={t.sidebar.clearSelectionTooltip}
-            className="p-1 rounded-md text-white/70 hover:text-white hover:bg-white/10 transition-colors"
+            className="p-1 rounded-lg text-white/70 hover:text-white hover:bg-white/10 transition-colors"
           >
             <X size={13} />
           </button>
@@ -667,78 +736,154 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <div
             ref={menuRef}
             role="menu"
-            className="fixed z-50 backdrop-blur-2xl bg-white/95 dark:bg-[#1c1c1e]/90 border border-black/[0.08] dark:border-white/[0.12] rounded-2xl shadow-2xl p-1.5 text-xs text-[#1d1d1f] dark:text-[#ededf0] min-w-[160px] animate-in fade-in zoom-in-95 duration-150"
+            className="fixed z-50 bg-white dark:bg-[#1a2336] border border-slate-200 dark:border-slate-700 rounded-2xl shadow-[0_16px_40px_rgba(15,23,42,0.18)] dark:shadow-[0_16px_40px_rgba(0,0,0,0.6)] p-1.5 text-[12.5px] text-slate-800 dark:text-slate-100 min-w-[180px] animate-in fade-in zoom-in-95 duration-150"
             style={{ left: contextMenu.x, top: contextMenu.y }}
           >
             {contextMenu.kind === 'folder' ? (
-              <button
-                role="menuitem"
-                onClick={() => {
-                  onSetFolderPinned(contextMenu.path, !pinnedFolderTimes.has(folderPinKey(contextMenu.path)));
-                  closeContextMenu();
-                }}
-                className="w-full flex items-center gap-2 px-3 py-1.5 rounded-xl hover:bg-black/[0.05] dark:hover:bg-white/[0.1] text-left transition-colors"
-              >
-                {pinnedFolderTimes.has(folderPinKey(contextMenu.path)) ? <PinOff size={12} /> : <Pin size={12} />}
-                {pinnedFolderTimes.has(folderPinKey(contextMenu.path)) ? t.sidebar.unpinFolder : t.sidebar.pinFolder}
-              </button>
+              <>
+                {onOpenPrismProject && (
+                  <>
+                    <button
+                      role="menuitem"
+                      onClick={() => {
+                        onOpenPrismProject(contextMenu.path, 'new-workspace');
+                        closeContextMenu();
+                      }}
+                      className="w-full flex items-center gap-2 px-3 py-1.5 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800/80 text-left transition-colors font-medium text-blue-600 dark:text-sky-400"
+                    >
+                      <Sparkles size={12} />
+                      {t.sidebar.menuOpenPrismNew}
+                    </button>
+                    <button
+                      role="menuitem"
+                      onClick={() => {
+                        onOpenPrismProject(contextMenu.path, 'parallel-root');
+                        closeContextMenu();
+                      }}
+                      className="w-full flex items-center gap-2 px-3 py-1.5 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800/80 text-left transition-colors"
+                    >
+                      <FolderPlus size={12} className="text-slate-400" />
+                      {t.sidebar.menuOpenPrismParallel}
+                    </button>
+                  </>
+                )}
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    onOpenFolder(contextMenu.path);
+                    closeContextMenu();
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800/80 text-left transition-colors"
+                >
+                  <Folder size={12} className="text-slate-400" />
+                  {t.sidebar.menuOpenFolder}
+                </button>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    onOpenVSCode(contextMenu.path);
+                    closeContextMenu();
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800/80 text-left transition-colors"
+                >
+                  <Code2 size={12} className="text-slate-400" />
+                  {t.sidebar.menuOpenVSCode}
+                </button>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    onSetFolderPinned(contextMenu.path, !pinnedFolderTimes.has(folderPinKey(contextMenu.path)));
+                    closeContextMenu();
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800/80 text-left transition-colors"
+                >
+                  {pinnedFolderTimes.has(folderPinKey(contextMenu.path)) ? <PinOff size={12} /> : <Pin size={12} />}
+                  {pinnedFolderTimes.has(folderPinKey(contextMenu.path)) ? t.sidebar.unpinFolder : t.sidebar.pinFolder}
+                </button>
+              </>
             ) : (
-            <>
-            <button
-              role="menuitem"
-              onClick={() => {
-                onSetPinned(contextMenu.conv.id, !contextMenu.conv.pinned_at);
-                closeContextMenu();
-              }}
-              className="w-full flex items-center gap-2 px-3 py-1.5 rounded-xl hover:bg-black/[0.05] dark:hover:bg-white/[0.1] text-left transition-colors"
-            >
-              {contextMenu.conv.pinned_at ? <PinOff size={12} /> : <Pin size={12} />}
-              {contextMenu.conv.pinned_at ? t.sidebar.unpinConversation : t.sidebar.pinConversation}
-            </button>
-            {publishSelection.size > 1 && publishSelection.has(contextMenu.conv.id) ? (
-              <button
-                onClick={() => {
-                  onBatchExportMarkdown(Array.from(publishSelection));
-                  closeContextMenu();
-                }}
-                className="w-full flex items-center gap-2 px-3 py-1.5 rounded-xl hover:bg-black/[0.05] dark:hover:bg-white/[0.1] text-left transition-colors font-medium text-[#0071e3] dark:text-[#2997ff]"
-              >
-                <FileDown size={12} />
-                {t.sidebar.batchExportMd} ({publishSelection.size})
-              </button>
-            ) : (
-              <button
-                onClick={() => {
-                  onBatchExportMarkdown([contextMenu.conv.id]);
-                  closeContextMenu();
-                }}
-                className="w-full flex items-center gap-2 px-3 py-1.5 rounded-xl hover:bg-black/[0.05] dark:hover:bg-white/[0.1] text-left transition-colors"
-              >
-                <FileDown size={12} className="text-[#86868b]" />
-                {t.sidebar.menuExportMd}
-              </button>
-            )}
-            <button
-              onClick={() => {
-                onRename(contextMenu.conv.id, contextMenu.conv.title);
-                closeContextMenu();
-              }}
-              className="w-full flex items-center gap-2 px-3 py-1.5 rounded-xl hover:bg-black/[0.05] dark:hover:bg-white/[0.1] text-left transition-colors"
-            >
-              <Edit2 size={12} className="text-[#86868b]" />
-              {t.sidebar.menuRename}
-            </button>
-            <button
-              onClick={() => {
-                onDelete(contextMenu.conv.id, contextMenu.conv.title);
-                closeContextMenu();
-              }}
-              className="w-full flex items-center gap-2 px-3 py-1.5 rounded-xl hover:bg-[#ff3b30]/15 dark:hover:bg-[#ff453a]/20 text-[#ff3b30] dark:text-[#ff453a] text-left transition-colors"
-            >
-              <Trash2 size={12} />
-              {t.sidebar.menuDelete}
-            </button>
-            </>
+              <>
+                {onHandoff && (
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      onHandoff(contextMenu.conv);
+                      closeContextMenu();
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-1.5 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800/80 text-left transition-colors font-medium text-blue-600 dark:text-sky-400"
+                  >
+                    <ArrowRightLeft size={12} />
+                    {t.sidebar.menuHandoff}
+                  </button>
+                )}
+                {onReadConversationInPrism && (
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      onReadConversationInPrism(contextMenu.conv.id);
+                      closeContextMenu();
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-1.5 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800/80 text-left transition-colors font-medium text-blue-600 dark:text-sky-400"
+                  >
+                    <BookOpen size={12} />
+                    {t.sidebar.menuReadInPrism}
+                  </button>
+                )}
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    onSetPinned(contextMenu.conv.id, !contextMenu.conv.pinned_at);
+                    closeContextMenu();
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800/80 text-left transition-colors"
+                >
+                  {contextMenu.conv.pinned_at ? <PinOff size={12} /> : <Pin size={12} />}
+                  {contextMenu.conv.pinned_at ? t.sidebar.unpinConversation : t.sidebar.pinConversation}
+                </button>
+                {publishSelection.size > 1 && publishSelection.has(contextMenu.conv.id) ? (
+                  <button
+                    onClick={() => {
+                      onBatchExportMarkdown(Array.from(publishSelection));
+                      closeContextMenu();
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-1.5 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800/80 text-left transition-colors font-medium text-blue-600 dark:text-sky-400"
+                  >
+                    <FileDown size={12} />
+                    {t.sidebar.batchExportMd} ({publishSelection.size})
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => {
+                      onBatchExportMarkdown([contextMenu.conv.id]);
+                      closeContextMenu();
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-1.5 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800/80 text-left transition-colors"
+                  >
+                    <FileDown size={12} className="text-slate-400" />
+                    {t.sidebar.menuExportMd}
+                  </button>
+                )}
+                <button
+                  onClick={() => {
+                    onRename(contextMenu.conv.id, contextMenu.conv.title);
+                    closeContextMenu();
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800/80 text-left transition-colors"
+                >
+                  <Edit2 size={12} className="text-slate-400" />
+                  {t.sidebar.menuRename}
+                </button>
+                <button
+                  onClick={() => {
+                    onDelete(contextMenu.conv.id, contextMenu.conv.title);
+                    closeContextMenu();
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 rounded-xl hover:bg-rose-50 dark:hover:bg-rose-500/15 text-rose-600 dark:text-rose-400 text-left transition-colors"
+                >
+                  <Trash2 size={12} />
+                  {t.sidebar.menuDelete}
+                </button>
+              </>
             )}
           </div>,
           document.body

@@ -13,6 +13,7 @@ export interface AntigravityCandidate {
   project_path?: string;
   status: string;
   exists_locally: boolean;
+  has_updates?: boolean;
   transcript_path: string;
   has_full_transcript: boolean;
 }

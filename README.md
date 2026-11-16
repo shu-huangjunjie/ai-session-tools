@@ -4,6 +4,14 @@ Windows 本地 AI 工具管理器，支持 **Codex、Claude 和 Antigravity** �
 
 桌面程序仍显示原名称 **Context Vault**，可执行文件为 `Context-Vault.exe`。
 
+## 本地 Google OAuth 配置
+
+Antigravity 账号登录和额度查询会读取本机已安装客户端中的 OAuth 参数。需要额外配置时，参照 `oauth-clients.example.json` 创建 `oauth-clients.local.json`，填入自己使用的客户端参数。
+
+开发时可将该文件放在项目根目录；桌面程序可放在执行文件旁，或 `%LOCALAPPDATA%\ContextRestoration\` 中。也可通过 `CONTEXT_VAULT_OAUTH_CLIENT_FILE` 指定文件路径，或同时设置 `ANTIGRAVITY_GOOGLE_CLIENT_ID` 与 `ANTIGRAVITY_GOOGLE_CLIENT_SECRET`。修改后重启应用。
+
+真实参数仅在本地保存，`oauth-clients.local.json` 已加入 Git 忽略规则；仓库只提供占位示例。
+
 ## Windows 安装版（x64 / ARM64）
 
 `0.1.6` 提供两套 NSIS 安装程序：
@@ -98,6 +106,11 @@ node .\scripts\verify_installers.mjs "C:\Program Files\7-Zip\7z.exe"
   - 显示剩余额度：Codex 与 Claude 的 5 小时 / 每周额度，Antigravity 按模型家族汇总，可展开查看每个模型；
   - 「添加账号」：浏览器登录（Antigravity 用 Google 授权，不用先在 Antigravity 里登录）、粘贴 refresh token、导入 `auth.json`、手动添加中转或从 cc-switch 导入，以及保存当前登录；
   - 正在使用的 Codex、Claude 账号不由本程序刷新 token，避免把客户端挤下线；查询额度走 Windows 系统代理与证书；
+- [x] **与棱镜工坊 PrismStudio 双向深度联动**：
+  - 会话顶栏、侧栏工程树右键及技能页均将 **「棱镜工坊」** 设为主工作台按钮（同时保留 VS Code 备选），通过本地单实例桥接复用已开窗口，支持 **在新工作空间秒开项目** 或 **并列挂载到当前空间**，不重复开新窗口；
+  - 消息正文智能识别 `[label](file:///...#L10-L20)`、`D:\path\file.py:42`、`conversation://<id>` 与外部链接：点击文件胶囊直接打开 `PrismStudio` 并精准跳转到对应行号，点击会话胶囊直接在库内秒切关联会话；
+  - 消息内代码块新增 **「棱镜运行」** 与 **「送入棱镜」**，会话顶栏新增 **「在棱镜精排研读此会话 (LaTeX/Mermaid)」**，并新增会话内角色筛选（全部 / 仅提问 / 仅回复）与 `Ctrl+F` 全消息关键词过滤高亮；
+  - 内置本地回环鉴权桥接与无窗口 `--headless-bridge-query`，支持在 `PrismStudio` 侧栏直接检索、阅读当前工程关联的 AI 历史会话并反向唤醒定位到 `Context Vault`；
 - [x] **导入与导出**：
   - 支持 ChatGPT 官方导出（ZIP / `conversations.json`）、Markdown 与通用 JSON/JSONL；
   - 支持将当前会话一键导出为 Markdown 与 JSON；

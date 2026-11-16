@@ -624,14 +624,46 @@ fn display(path: &Path) -> String {
 fn strip_verbatim(path: &Path) -> String {
     let text = path.to_string_lossy().to_string();
     text.strip_prefix(r"\\?\UNC\")
+        .or_else(|| text.strip_prefix(r"\??\UNC\"))
         .map(|rest| format!(r"\\{}", rest))
         .or_else(|| text.strip_prefix(r"\\?\").map(str::to_string))
+        .or_else(|| text.strip_prefix(r"\??\").map(str::to_string))
         .unwrap_or(text)
+}
+
+/// 展开 Windows 8.3 短路径（如 `HUANGJ~1`），但不解引用叶子目录联接本身，
+/// 也兼容尚未创建的子路径。
+fn expand_path_without_following_leaf(path: &Path) -> PathBuf {
+    let stripped = PathBuf::from(strip_verbatim(path));
+    if !is_reparse_point(&stripped) {
+        if let Ok(canon) = fs::canonicalize(&stripped) {
+            return PathBuf::from(strip_verbatim(&canon));
+        }
+    }
+    let mut tail = Vec::new();
+    let mut cur = stripped.as_path();
+    while let Some(name) = cur.file_name() {
+        tail.push(name.to_os_string());
+        let Some(parent) = cur.parent() else {
+            break;
+        };
+        if !is_reparse_point(parent) {
+            if let Ok(canon) = fs::canonicalize(parent) {
+                let mut rebuilt = PathBuf::from(strip_verbatim(&canon));
+                for comp in tail.into_iter().rev() {
+                    rebuilt.push(comp);
+                }
+                return rebuilt;
+            }
+        }
+        cur = parent;
+    }
+    stripped
 }
 
 /// 路径比较键：统一分隔符、去掉末尾分隔符并忽略大小写（Windows 路径不区分大小写）。
 fn path_key(path: &Path) -> String {
-    strip_verbatim(path)
+    strip_verbatim(&expand_path_without_following_leaf(path))
         .replace('/', "\\")
         .trim_end_matches('\\')
         .to_lowercase()

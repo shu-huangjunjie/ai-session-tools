@@ -65,3 +65,17 @@ export interface CanonicalMessage {
   created_at: string;
   updated_at: string;
 }
+
+export type PrismOpenMode = 'new-workspace' | 'parallel-root' | 'file';
+
+export interface PrismStudioStatus {
+  available: boolean;
+  running: boolean;
+  exePath?: string | null;
+}
+
+export interface VaultFocusPayload {
+  conversationId?: string | null;
+  sourceKind?: string | null;
+  projectPath?: string | null;
+}

@@ -28,6 +28,8 @@ pub struct ClaudeCandidate {
     pub last_modified_time: String,
     pub project_path: Option<String>,
     pub exists_locally: bool,
+    #[serde(default)]
+    pub has_updates: bool,
     pub session_file_path: String,
     pub custom_title: Option<String>,
 }
@@ -261,8 +263,8 @@ impl<'a> ClaudeRecoveryService<'a> {
         let excluded_ids = repo
             .excluded_source_ids(Self::SOURCE_TYPE)
             .unwrap_or_default();
-        let imported_ids = repo
-            .imported_source_ids(Self::SOURCE_TYPE)
+        let imported_snapshots = repo
+            .imported_source_snapshots(Self::SOURCE_TYPE)
             .unwrap_or_default();
 
         let mut excluded_count = 0;
@@ -369,7 +371,19 @@ impl<'a> ClaudeRecoveryService<'a> {
                     final_title.clone()
                 };
 
-                let exists_locally = imported_ids.contains(&session_id);
+                let exists_locally = imported_snapshots.contains_key(&session_id);
+                let has_updates = imported_snapshots
+                    .get(&session_id)
+                    .map(|snap| {
+                        let parsed = Self::parse_session_file(&sess_path, &session_id);
+                        snap.has_message_or_path_updates(
+                            Self::SOURCE_TYPE,
+                            &session_id,
+                            &parsed,
+                            cwd.as_deref(),
+                        )
+                    })
+                    .unwrap_or(false);
 
                 candidates.push(ClaudeCandidate {
                     session_id,
@@ -379,6 +393,7 @@ impl<'a> ClaudeRecoveryService<'a> {
                     last_modified_time,
                     project_path: cwd,
                     exists_locally,
+                    has_updates,
                     session_file_path: sess_path.to_string_lossy().to_string(),
                     custom_title,
                 });

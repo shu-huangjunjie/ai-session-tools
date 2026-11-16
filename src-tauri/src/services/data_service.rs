@@ -31,7 +31,10 @@ impl<'a> DataService<'a> {
         Ok(())
     }
 
-    pub fn export_markdown(&self, conversation_id: &str, destination: &Path) -> Result<(), String> {
+    pub fn render_conversation_markdown(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(crate::domain::Conversation, String), String> {
         let repo = Repository::new(self.db);
         let conv = repo
             .get_conversation(conversation_id)
@@ -39,22 +42,33 @@ impl<'a> DataService<'a> {
             .ok_or_else(|| "会话不存在".to_string())?;
 
         let msgs = repo
-            .load_active_path(conversation_id)
+            .load_active_path_or_chronological(conversation_id)
             .map_err(|e| format!("读取消息失败：{}", e))?;
 
         let mut lines = Vec::new();
         lines.push(format!("# {}", conv.title));
         lines.push(String::new());
+        let source_label = match conv.source_kind.as_str() {
+            "antigravity" => "Antigravity",
+            "claude" => "Claude",
+            "codex_main" | "codex" => "Codex",
+            other => other,
+        };
+        lines.push(format!("> 来源客户端：{}", source_label));
         lines.push(format!(
             "> 创建时间：{}",
-            conv.created_at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S")
+            conv.created_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
         ));
         lines.push(format!(
             "> 更新时间：{}",
-            conv.updated_at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S")
+            conv.updated_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
         ));
         if let Some(ref proj) = conv.project_path {
-            lines.push(format!("> 项目目录：{}", proj));
+            lines.push(format!("> 项目目录：`{}`", proj));
         }
         lines.push(String::new());
 
@@ -65,20 +79,25 @@ impl<'a> DataService<'a> {
             lines.push(String::new());
         }
 
-        for msg in msgs {
+        for (idx, msg) in msgs.into_iter().enumerate() {
             let role_name = match msg.role {
                 MessageRole::System => "System",
                 MessageRole::Developer => "Developer",
                 MessageRole::User => "User",
                 MessageRole::Assistant => "Assistant",
             };
-            lines.push(format!("## {}", role_name));
+            lines.push(format!("## {}. {}", idx + 1, role_name));
             lines.push(String::new());
             lines.push(msg.content);
             lines.push(String::new());
         }
 
-        fs::write(destination, lines.join("\n")).map_err(|e| format!("写入 Markdown 失败：{}", e))?;
+        Ok((conv, lines.join("\n")))
+    }
+
+    pub fn export_markdown(&self, conversation_id: &str, destination: &Path) -> Result<(), String> {
+        let (_conv, markdown) = self.render_conversation_markdown(conversation_id)?;
+        fs::write(destination, markdown).map_err(|e| format!("写入 Markdown 失败：{}", e))?;
         Ok(())
     }
 

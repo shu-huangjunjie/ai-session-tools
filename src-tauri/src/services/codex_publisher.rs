@@ -4,8 +4,9 @@ use chrono::Local;
 use rusqlite::types::Value;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::fs;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,7 +50,7 @@ impl CodexClientPublisher {
         };
 
         let state_path = home.join("state_5.sqlite");
-        let catalog_path = home.join("sqlite").join("codex-dev.db");
+        let catalog_path = resolve_catalog_path(&home);
 
         Self {
             codex_home: home,
@@ -104,6 +105,15 @@ impl CodexClientPublisher {
         selected_thread_ids: &[String],
         purge_thread_ids: &[String],
     ) -> Result<CodexPublishResult, String> {
+        self.publish_with_titles(selected_thread_ids, purge_thread_ids, &HashMap::new())
+    }
+
+    pub fn publish_with_titles(
+        &self,
+        selected_thread_ids: &[String],
+        purge_thread_ids: &[String],
+        title_overrides: &HashMap<String, String>,
+    ) -> Result<CodexPublishResult, String> {
         self.require_databases()?;
         let provider = self
             .active_provider()
@@ -111,12 +121,13 @@ impl CodexClientPublisher {
 
         // Publishing hides every main thread that is not selected, so an empty or
         // unrecognized selection would hide the whole Codex sidebar.
-        {
+        let (has_title_col, has_name_col) = {
             let conn = Connection::open_with_flags(
                 &self.state_path,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             )
             .map_err(|e| format!("无法连接 state_5: {}", e))?;
+            let cols = thread_table_columns(&conn)?;
             let known: HashSet<String> = read_threads(&conn)?
                 .into_iter()
                 .filter(|r| !r.is_subagent)
@@ -128,9 +139,10 @@ impl CodexClientPublisher {
                         .to_string(),
                 );
             }
-        }
+            (cols.contains("title"), cols.contains("name"))
+        };
 
-        let backup_dir = self.backup_databases()?;
+        let backup_dir = self.backup_databases(!title_overrides.is_empty())?;
 
         let mut conn =
             Connection::open(&self.state_path).map_err(|e| format!("打开 state_5 失败: {}", e))?;
@@ -178,11 +190,44 @@ impl CodexClientPublisher {
             }
             if selected_set.contains(&r.id) {
                 state_selected_count += 1;
-                tx.execute(
-                    "UPDATE threads SET model_provider = ?1, archived = 0 WHERE id = ?2",
-                    params![provider, r.id],
-                )
-                .map_err(|e| e.to_string())?;
+                if let Some(custom_title) = title_overrides.get(&r.id) {
+                    match (has_title_col, has_name_col) {
+                        (true, true) => {
+                            tx.execute(
+                                "UPDATE threads SET model_provider = ?1, archived = 0, title = ?3, name = ?3 WHERE id = ?2",
+                                params![provider, r.id, custom_title],
+                            )
+                            .map_err(|e| e.to_string())?;
+                        }
+                        (true, false) => {
+                            tx.execute(
+                                "UPDATE threads SET model_provider = ?1, archived = 0, title = ?3 WHERE id = ?2",
+                                params![provider, r.id, custom_title],
+                            )
+                            .map_err(|e| e.to_string())?;
+                        }
+                        (false, true) => {
+                            tx.execute(
+                                "UPDATE threads SET model_provider = ?1, archived = 0, name = ?3 WHERE id = ?2",
+                                params![provider, r.id, custom_title],
+                            )
+                            .map_err(|e| e.to_string())?;
+                        }
+                        (false, false) => {
+                            tx.execute(
+                                "UPDATE threads SET model_provider = ?1, archived = 0 WHERE id = ?2",
+                                params![provider, r.id],
+                            )
+                            .map_err(|e| e.to_string())?;
+                        }
+                    }
+                } else {
+                    tx.execute(
+                        "UPDATE threads SET model_provider = ?1, archived = 0 WHERE id = ?2",
+                        params![provider, r.id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
             } else {
                 hidden_count += 1;
                 tx.execute(
@@ -258,10 +303,11 @@ impl CodexClientPublisher {
                 continue;
             }
             sequence += 1;
-            let display_title = r
-                .title
-                .clone()
-                .or(r.first_user_message.clone())
+            let display_title = title_overrides
+                .get(&r.id)
+                .cloned()
+                .or_else(|| r.title.clone())
+                .or_else(|| r.first_user_message.clone())
                 .unwrap_or_else(|| "Codex 会话".to_string());
             let source_kind = if r.source.as_deref() == Some("cli") {
                 "cli"
@@ -331,6 +377,23 @@ impl CodexClientPublisher {
 
         tx.commit().map_err(|e| format!("提交事务失败: {}", e))?;
 
+        let session_index = self.codex_home.join("session_index.jsonl");
+        if !title_overrides.is_empty() && session_index.is_file() {
+            if let Ok(mut f) = OpenOptions::new().append(true).open(&session_index) {
+                for r in &rows {
+                    if selected_set.contains(&r.id) {
+                        if let Some(custom_title) = title_overrides.get(&r.id) {
+                            let entry = serde_json::json!({
+                                "id": r.id,
+                                "thread_name": custom_title,
+                            });
+                            let _ = writeln!(f, "{}", entry);
+                        }
+                    }
+                }
+            }
+        }
+
         // 4. Quarantine purged rollouts
         let (quarantined_count, quarantine_warnings) =
             self.quarantine_rollouts(&rollout_purge_paths, &backup_dir);
@@ -398,7 +461,7 @@ impl CodexClientPublisher {
         Ok(res)
     }
 
-    fn backup_databases(&self) -> Result<PathBuf, String> {
+    fn backup_databases(&self, include_session_index: bool) -> Result<PathBuf, String> {
         let stamp = Local::now().format("%Y%m%d-%H%M%S-%3f").to_string();
         let target_dir =
             self.backup_root
@@ -409,7 +472,18 @@ impl CodexClientPublisher {
             backup_sqlite(&self.state_path, &target_dir.join("state_5.sqlite"))?;
         }
         if self.catalog_path.is_file() {
-            backup_sqlite(&self.catalog_path, &target_dir.join("codex-dev.db"))?;
+            let catalog_name = self
+                .catalog_path
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("codex.db"));
+            backup_sqlite(&self.catalog_path, &target_dir.join(catalog_name))?;
+        }
+        if include_session_index {
+            let session_index = self.codex_home.join("session_index.jsonl");
+            if session_index.is_file() {
+                fs::copy(&session_index, target_dir.join("session_index.jsonl"))
+                    .map_err(|e| format!("备份 session_index.jsonl 失败: {}", e))?;
+            }
         }
 
         Ok(target_dir)
@@ -469,21 +543,37 @@ struct ThreadRow {
     recency_at_ms: Option<i64>,
 }
 
+fn resolve_catalog_path(home: &Path) -> PathBuf {
+    let sqlite_dir = home.join("sqlite");
+    let modern = sqlite_dir.join("codex.db");
+    if modern.is_file() {
+        return modern;
+    }
+    let legacy = sqlite_dir.join("codex-dev.db");
+    if legacy.is_file() {
+        return legacy;
+    }
+    modern
+}
+
+fn thread_table_columns(conn: &Connection) -> Result<HashSet<String>, String> {
+    let mut columns = HashSet::new();
+    let mut info = conn
+        .prepare("PRAGMA table_info(threads)")
+        .map_err(|e| e.to_string())?;
+    let names = info
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?;
+    for name in names.flatten() {
+        columns.insert(name);
+    }
+    Ok(columns)
+}
+
 /// Reads the Codex thread index, tolerating columns that older or newer Codex
 /// builds do not have.
 fn read_threads(conn: &Connection) -> Result<Vec<ThreadRow>, String> {
-    let mut columns = HashSet::new();
-    {
-        let mut info = conn
-            .prepare("PRAGMA table_info(threads)")
-            .map_err(|e| e.to_string())?;
-        let names = info
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|e| e.to_string())?;
-        for name in names.flatten() {
-            columns.insert(name);
-        }
-    }
+    let columns = thread_table_columns(conn)?;
     if !columns.contains("id") {
         return Err("Codex state 数据库缺少 threads.id 列，无法发布".to_string());
     }

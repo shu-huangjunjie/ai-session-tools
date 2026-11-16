@@ -1,5 +1,6 @@
 import {
   AccountClient,
+  AccountLaunchRequest,
   AccountsState,
   AccountView,
   AntigravityCandidate,
@@ -17,7 +18,9 @@ import {
   ClaudePublishResult,
   ClaudeRecoveryReport,
   ClaudeRecoveryResult,
+  CodexDeviceAuthStart,
   CodexProject,
+  CodexProviderInput,
   CodexPublishPreview,
   CodexPublishResult,
   CodexRecoveryReport,
@@ -27,6 +30,8 @@ import {
   Conversation,
   ConversationSummary,
   FolderPin,
+  HandoffRequest,
+  HandoffResult,
   ImportPreview,
   ImportResult,
   McpClient,
@@ -34,6 +39,10 @@ import {
   McpLocation,
   McpServerEntry,
   McpSpec,
+  PrismOpenMode,
+  PrismStudioStatus,
+  ProviderTestResult,
+  QuickLaunchTool,
   QuotaRefreshFailure,
   ResetResult,
   ResetScope,
@@ -41,6 +50,8 @@ import {
   SkillDeleteOutcome,
   SkillEntry,
   SkillLocation,
+  TokenImportResult,
+  VaultFocusPayload,
 } from '../types';
 import { folderPinKey } from '../utils/folderPins';
 
@@ -94,6 +105,10 @@ export const api = {
 
   searchConversations: (query: string, limit?: number, includeArchived = false) =>
     invokeTauri<ConversationSummary[]>('search_conversations', { query, limit, includeArchived }),
+
+  /** Cross-tool or cross-account conversation handoff (Mode A native injection or Mode B compact pack). */
+  handoffConversation: (request: HandoffRequest) =>
+    invokeTauri<HandoffResult>('handoff_conversation', { request }),
 
   // Codex Operations
   scanCodex: () =>
@@ -205,6 +220,49 @@ export const api = {
   openVSCode: (path: string) =>
     invokeTauri<string>('open_vscode', { path }),
 
+  getPrismStudioStatus: () =>
+    invokeTauri<PrismStudioStatus>('get_prism_studio_status'),
+
+  openInPrismStudio: (
+    path: string,
+    mode?: PrismOpenMode,
+    line?: number,
+    projectPath?: string | null
+  ) =>
+    invokeTauri<string>('open_in_prism_studio', {
+      path,
+      mode: mode || null,
+      line: line ?? null,
+      projectPath: projectPath || null,
+    }),
+
+  sendCodeToPrismStudio: (params: {
+    language: string;
+    code: string;
+    title?: string;
+    projectPath?: string | null;
+    autoRun?: boolean;
+  }) =>
+    invokeTauri<string>('send_code_to_prism_studio', {
+      language: params.language,
+      code: params.code,
+      title: params.title || null,
+      projectPath: params.projectPath || null,
+      autoRun: params.autoRun ?? false,
+    }),
+
+  openConversationInPrismStudio: (conversationId: string) =>
+    invokeTauri<string>('open_conversation_in_prism_studio', { conversationId }),
+
+  drainVaultBridgeFocus: () =>
+    invokeTauri<VaultFocusPayload[]>('drain_vault_bridge_focus'),
+
+  resolveConversationLink: (idOrSourceId: string) =>
+    invokeTauri<VaultFocusPayload | null>('resolve_conversation_link', { idOrSourceId }),
+
+  openExternalUrl: (url: string) =>
+    invokeTauri<void>('open_external_url', { url }),
+
   getAppPaths: () =>
     invokeTauri<AppPathsInfo>('get_app_paths'),
 
@@ -288,17 +346,33 @@ export const api = {
   /** Saves the client's current login; returns the account id. */
   saveCurrentAccount: (client: AccountClient) => invokeTauri<string>('save_current_account', { client }),
 
-  /** Codex only: imports an `auth.json`. */
-  importAccountFile: (client: AccountClient, path: string) => invokeTauri<string>('import_account_file', { client, path }),
+  /** Imports one account JSON/auth file (e.g. Codex auth.json, Claude/Antigravity export); returns imported count & failures. */
+  importAccountFile: (client: AccountClient, path: string) =>
+    invokeTauri<TokenImportResult>('import_account_file', { client, path }),
 
   pickAuthJsonPath: (initialDir?: string) =>
     invokeTauri<string | null>('pick_auth_json_path', { initialDir: initialDir || null }),
 
-  /** Runs the official CLI login in a separate folder (opens the browser); returns the new account id. */
-  loginAccount: (client: AccountClient) => invokeTauri<string>('login_account', { client }),
+  /**
+   * Starts OAuth login (`mode`: Codex `'oauth'` PKCE / `'cli'`, Claude `'pkce'` / `'cli'`,
+   * Antigravity Google OAuth). Returns the new/updated account id.
+   */
+  loginAccount: (client: AccountClient, mode?: 'oauth' | 'cli' | 'pkce') =>
+    invokeTauri<string>('login_account', { client, mode: mode ?? null }),
+
+  /** Submits a manually pasted OAuth callback URL or authorization code for a waiting PKCE login. */
+  submitAccountLoginCallback: (callbackUrl: string) =>
+    invokeTauri<void>('submit_account_login_callback', { callbackUrl }),
+
+  /** Starts a Codex 2-step Device Code login flow and returns the code + verification URL. */
+  startCodexDeviceLogin: () => invokeTauri<CodexDeviceAuthStart>('start_codex_device_login'),
+
+  /** Polls until the Codex Device Code login finishes and saves the account; returns its id. */
+  completeCodexDeviceLogin: (start: CodexDeviceAuthStart) =>
+    invokeTauri<string>('complete_codex_device_login', { start }),
 
   /**
-   * Calls back with the Google authorization link while an Antigravity sign-in waits, for opening it by hand.
+   * Calls back with the authorization link while a browser OAuth sign-in waits, for copying or opening by hand.
    * Returns a function that stops listening.
    */
   onAccountLoginUrl: async (callback: (url: string) => void): Promise<() => void> => {
@@ -307,9 +381,9 @@ export const api = {
     return listen<string>('account-login-url', (event) => callback(event.payload));
   },
 
-  /** Imports Antigravity refresh tokens (one per line, or account JSON). */
+  /** Imports refresh tokens / JSON payloads (one per line or JSON array); works across all 3 clients. */
   importAccountTokens: (client: AccountClient, text: string) =>
-    invokeTauri<{ imported: number; failures: string[] }>('import_account_tokens', { client, text }),
+    invokeTauri<TokenImportResult>('import_account_tokens', { client, text }),
 
   cancelAccountLogin: () => invokeTauri<void>('cancel_account_login'),
 
@@ -319,15 +393,77 @@ export const api = {
 
   deleteAccount: (client: AccountClient, id: string) => invokeTauri<void>('delete_account', { client, id }),
 
+  /**
+   * Updates account tags and/or note. Pass `tags: null` to keep tags unchanged;
+   * pass `note: ''` to clear the note and `note: null` to leave it unchanged.
+   */
+  updateAccountMeta: (client: AccountClient, id: string, tags: string[] | null, note: string | null) =>
+    invokeTauri<void>('update_account_meta', { client, id, tags, note }),
+
+  batchUpdateAccountTags: (client: AccountClient, ids: string[], addTags: string[], removeTags: string[]) =>
+    invokeTauri<number>('batch_update_account_tags', { client, ids, addTags, removeTags }),
+
+  batchDeleteAccounts: (client: AccountClient, ids: string[]) =>
+    invokeTauri<number>('batch_delete_accounts', { client, ids }),
+
   refreshAccountQuota: (client: AccountClient, id: string) => invokeTauri<void>('refresh_account_quota', { client, id }),
 
-  refreshAllAccountQuotas: (client: AccountClient) =>
-    invokeTauri<QuotaRefreshFailure[]>('refresh_all_account_quotas', { client }),
+  refreshAllAccountQuotas: (client: AccountClient, ids?: string[]) =>
+    invokeTauri<QuotaRefreshFailure[]>('refresh_all_account_quotas', { client, ids: ids ?? null }),
 
   upsertClaudeProvider: (input: ClaudeProviderInput) => invokeTauri<string>('upsert_claude_provider', { input }),
 
+  upsertCodexProvider: (input: CodexProviderInput) => invokeTauri<string>('upsert_codex_provider', { input }),
+
+  testProviderConnection: (baseUrl: string, apiKey: string, authField?: string | null) =>
+    invokeTauri<ProviderTestResult>('test_provider_connection', {
+      baseUrl,
+      apiKey,
+      authField: authField ?? null,
+    }),
+
+  /** Reads cc-switch's providers for the given client (read-only); returns how many were added. */
+  importCcSwitchProviders: (client: AccountClient) =>
+    invokeTauri<number>('import_cc_switch_providers', { client }),
+
   /** Reads cc-switch's Claude relays (read-only); returns how many were added. */
   importCcSwitchClaudeProviders: () => invokeTauri<number>('import_cc_switch_claude_providers'),
+
+  /** Imports saved accounts for `client` from local Cockpit Tools data (`~/.cockpit_tools` etc.). */
+  importCockpitToolsAccounts: (client: AccountClient) =>
+    invokeTauri<TokenImportResult>('import_cockpit_tools_accounts', { client }),
+
+  /** Exports selected (or all) accounts for `client` to JSON string, optionally saving to `path`. */
+  exportAccountsJson: (client: AccountClient, ids?: string[], path?: string) =>
+    invokeTauri<string>('export_accounts_json', { client, ids: ids ?? null, path: path ?? null }),
+
+  /** Launches the client's CLI (`codex`, `claude`, or `agy`) inside `folderPath`, optionally after switching to `id`. */
+  launchAccountCli: (client: AccountClient, folderPath: string, id?: string | null) =>
+    invokeTauri<void>('launch_account_cli', { client, id: id ?? null, folderPath }),
+  /** Validates target/folder, safely switches account if needed, and launches the chosen desktop app, CLI, or editor. */
+  launchAccountTarget: (request: AccountLaunchRequest) =>
+    invokeTauri<void>('launch_account_target', { request }),
+  /** Opens a file picker filtered to executables (`.exe`, `.cmd`, `.bat`). */
+  pickExecutablePath: (initialDir?: string) =>
+    invokeTauri<string | null>('pick_executable_path', { initialDir }),
+  /** Lists all quick-launch AI clients, CLIs, editors, and terminals with detected status. */
+  listQuickLaunchTools: () => invokeTauri<QuickLaunchTool[]>('list_quick_launch_tools'),
+  /** Launches a quick-launch tool by id with optional working folder, terminal kind, and CLI custom command. */
+  launchQuickTool: (
+    toolId: string,
+    folderPath?: string | null,
+    terminal?: string | null,
+    customCommand?: string | null,
+  ) =>
+    invokeTauri<void>('launch_quick_tool', {
+      toolId,
+      folderPath: folderPath ?? null,
+      terminal: terminal ?? null,
+      customCommand: customCommand ?? null,
+    }),
+  /** Saves or clears a custom executable override for a quick-launch tool. */
+  setQuickLaunchCustomPath: (toolId: string, customPath: string | null) =>
+    invokeTauri<QuickLaunchTool[]>('set_quick_launch_custom_path', { toolId, customPath }),
 };
 
 /** Tauri rejects with a plain string; other failures arrive as Error objects. */
@@ -523,18 +659,24 @@ const hoursFromNow = (h: number) => new Date(Date.now() + h * 3600000).toISOStri
 const MOCK_ACCOUNTS: Record<AccountClient, AccountView[]> = {
   codex: [
     {
-      id: 'cx-1', email: 'work@example.com', plan_type: 'pro', is_current: true, has_quota: true,
+      id: 'cx-1', kind: 'oauth', email: 'work@example.com', plan_type: 'pro', is_current: true, has_quota: true,
+      tags: ['主力'], note: '日常开发使用',
       added_at: hoursFromNow(-200), last_used_at: hoursFromNow(-2), quota_updated_at: hoursFromNow(-0.1),
       quota: { plan_type: 'pro', windows: [
         { kind: 'primary', used_percent: 38, window_minutes: 300, resets_at: hoursFromNow(2.5) },
         { kind: 'secondary', used_percent: 64, window_minutes: 10080, resets_at: hoursFromNow(70) },
       ] },
     },
-    { id: 'cx-2', email: 'old@example.com', plan_type: 'free', is_current: false, has_quota: true, added_at: hoursFromNow(-500), quota_error: 'token 已失效，请用这个账号重新登录' },
+    {
+      id: 'cx-2', kind: 'oauth', email: 'old@example.com', plan_type: 'free', is_current: false, has_quota: true,
+      tags: ['备用'],
+      added_at: hoursFromNow(-500), quota_error: 'token 已失效，请用这个账号重新登录',
+    },
   ],
   claude: [
     {
       id: 'cl-1', kind: 'oauth', email: 'me@example.com', plan_type: 'max', detail: 'Personal', is_current: false, has_quota: true,
+      tags: ['主力', 'Opus'],
       added_at: hoursFromNow(-80), quota_updated_at: hoursFromNow(-0.5),
       quota: { plan_type: 'max', windows: [
         { kind: 'five_hour', used_percent: 12, window_minutes: 300, resets_at: hoursFromNow(3) },
@@ -542,16 +684,26 @@ const MOCK_ACCOUNTS: Record<AccountClient, AccountView[]> = {
         { kind: 'seven_day_opus', label: 'Opus', used_percent: 55, window_minutes: 10080, resets_at: hoursFromNow(90) },
       ] },
     },
-    { id: 'cl-2', kind: 'provider', name: 'CloudHabitat', detail: 'https://ai.example.com · claude-sonnet-4-6', is_current: true, has_quota: false, added_at: hoursFromNow(-30) },
+    {
+      id: 'cl-2', kind: 'provider', name: 'CloudHabitat', detail: 'https://ai.example.com · claude-sonnet-4-6',
+      base_url: 'https://ai.example.com', model: 'claude-sonnet-4-6', auth_field: 'ANTHROPIC_AUTH_TOKEN',
+      tags: ['中转'], is_current: true, has_quota: false, added_at: hoursFromNow(-30),
+    },
   ],
   antigravity: [
     {
       id: 'ag-1', email: 'user@gmail.com', name: 'User', plan_type: 'Google AI Pro', is_current: true, has_quota: true,
+      tags: ['主力'], note: 'Gemini + Claude 配额',
       added_at: hoursFromNow(-300), quota_updated_at: hoursFromNow(-0.2),
-      quota: { plan_type: 'Google AI Pro', windows: [
+      quota: { plan_type: 'Google AI Pro', credits_balance: '1200 credits', windows: [
         { kind: 'claude-sonnet', label: 'Claude Sonnet 4.5', used_percent: 100, resets_at: hoursFromNow(4) },
         { kind: 'gemini-3-pro', label: 'Gemini 3 Pro', used_percent: 20, resets_at: hoursFromNow(4) },
       ] },
+    },
+    {
+      id: 'ag-2', email: 'verify@gmail.com', name: 'Verify Demo', plan_type: 'Free', is_current: false, has_quota: true,
+      tags: ['待验证'], verification_url: 'https://accounts.google.com/',
+      added_at: hoursFromNow(-120), quota_error: '账号需要安全验证',
     },
   ],
 };
@@ -664,13 +816,18 @@ async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Promi
         current: current ? { kind: current.kind, email: current.email, name: current.name, plan_type: current.plan_type, saved: true } : null,
         current_note: null,
         notes: [],
-        accounts: accounts.map((a) => ({ ...a })),
+        accounts: accounts.map((a) => ({ ...a, tags: [...(a.tags ?? [])] })),
+        cockpit_import_count: client === 'codex' ? 1 : 0,
+        cc_switch_available: client !== 'antigravity',
       } as unknown as T;
     }
     case 'switch_account': {
       const accounts = MOCK_ACCOUNTS[args?.client as AccountClient];
       if (!accounts.some((a) => a.id === args?.id)) throw '账号不存在';
-      for (const a of accounts) a.is_current = a.id === args?.id;
+      for (const a of accounts) {
+        a.is_current = a.id === args?.id;
+        if (a.is_current) a.last_used_at = new Date().toISOString();
+      }
       return false as unknown as T;
     }
     case 'delete_account': {
@@ -680,18 +837,72 @@ async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Promi
       accounts.splice(index, 1);
       return undefined as T;
     }
+    case 'update_account_meta': {
+      const accounts = MOCK_ACCOUNTS[args?.client as AccountClient];
+      const target = accounts.find((a) => a.id === args?.id);
+      if (!target) throw '账号不存在';
+      if (Array.isArray(args?.tags)) target.tags = [...(args.tags as string[])];
+      if (typeof args?.note === 'string') target.note = args.note.trim() || null;
+      return undefined as T;
+    }
+    case 'batch_update_account_tags': {
+      const accounts = MOCK_ACCOUNTS[args?.client as AccountClient];
+      const ids = new Set((args?.ids as string[]) ?? []);
+      const addTags = (args?.addTags as string[]) ?? [];
+      const removeTags = new Set((args?.removeTags as string[]) ?? []);
+      let updated = 0;
+      for (const a of accounts) {
+        if (!ids.has(a.id)) continue;
+        const next = new Set((a.tags ?? []).filter((t) => !removeTags.has(t)));
+        for (const t of addTags) next.add(t);
+        a.tags = Array.from(next);
+        updated += 1;
+      }
+      return updated as unknown as T;
+    }
+    case 'batch_delete_accounts': {
+      const accounts = MOCK_ACCOUNTS[args?.client as AccountClient];
+      const ids = new Set((args?.ids as string[]) ?? []);
+      const before = accounts.length;
+      for (let i = accounts.length - 1; i >= 0; i -= 1) {
+        if (ids.has(accounts[i].id)) accounts.splice(i, 1);
+      }
+      return (before - accounts.length) as unknown as T;
+    }
+    case 'export_accounts_json': {
+      const accounts = MOCK_ACCOUNTS[args?.client as AccountClient];
+      const ids = args?.ids as string[] | null | undefined;
+      const list = ids?.length ? accounts.filter((a) => ids.includes(a.id)) : accounts;
+      return JSON.stringify(list, null, 2) as unknown as T;
+    }
+    case 'test_provider_connection':
+      return {
+        ok: true,
+        latency_ms: 142,
+        models: ['claude-sonnet-4-6', 'claude-opus-4-6', 'gpt-4o'],
+        message: 'HTTP 200 OK',
+      } as unknown as T;
     case 'refresh_account_quota':
       return undefined as T;
     case 'refresh_all_account_quotas':
       return [] as unknown as T;
     case 'save_current_account':
       return 'mock' as unknown as T;
+    case 'import_cc_switch_providers':
     case 'import_cc_switch_claude_providers':
       return 0 as unknown as T;
+    case 'import_cockpit_tools_accounts':
+      return { imported: 0, failures: [] } as unknown as T;
+    case 'launch_account_cli':
+      return undefined as T;
     case 'login_account':
+    case 'submit_account_login_callback':
+    case 'start_codex_device_login':
+    case 'complete_codex_device_login':
     case 'import_account_file':
     case 'import_account_tokens':
     case 'upsert_claude_provider':
+    case 'upsert_codex_provider':
       throw '浏览器预览中不可用';
     case 'pick_auth_json_path':
       return null as unknown as T;
@@ -1113,6 +1324,76 @@ async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Promi
       } as unknown as T;
     case 'batch_export_markdown':
       return ((args?.conversationIds as string[]) || []).length as unknown as T;
+    case 'get_prism_studio_status':
+      return {
+        available: true,
+        running: true,
+        exePath: 'D:\\tools\\md-pdf-viewer\\releases\\desktop\\PrismStudio.exe',
+      } as unknown as T;
+    case 'open_in_prism_studio':
+    case 'send_code_to_prism_studio':
+    case 'open_conversation_in_prism_studio':
+      return 'reused-window' as unknown as T;
+    case 'drain_vault_bridge_focus':
+      return [] as unknown as T;
+    case 'resolve_conversation_link':
+      return null as unknown as T;
+    case 'open_external_url':
+      return undefined as unknown as T;
+    case 'pick_executable_path':
+      return 'C:\\Tools\\custom-tool.exe' as unknown as T;
+    case 'list_quick_launch_tools':
+      return getMockQuickLaunchTools() as unknown as T;
+    case 'launch_quick_tool':
+    case 'launch_account_target':
+      return undefined as unknown as T;
+    case 'handoff_conversation': {
+      const req = (args?.request ?? {}) as Partial<HandoffRequest>;
+      const mode = req.mode ?? 'native';
+      const client = req.targetClient ?? 'claude';
+      const sid = mode === 'native' ? 'mock-handoff-uuid-1234' : null;
+      const file = mode === 'compact' ? '.context-vault/handoff-mock1234.md' : null;
+      const prompt =
+        mode === 'compact'
+          ? '请先阅读 .context-vault/handoff-mock1234.md 了解前序会话上下文与当前代码进度，然后继续推进其中的下一步任务。'
+          : client === 'codex'
+            ? 'codex resume mock-handoff-uuid-1234'
+            : client === 'antigravity'
+              ? 'agy --conversation mock-handoff-uuid-1234'
+              : 'claude --resume mock-handoff-uuid-1234';
+      const cmd =
+        mode === 'compact'
+          ? `${client === 'antigravity' ? 'agy -i' : client} "${prompt}"`
+          : prompt;
+      return {
+        mode,
+        targetClient: client,
+        targetSessionId: sid,
+        handoffFilePath: file,
+        workingDir: req.folderPath ?? null,
+        cliCommand: cmd,
+        clipboardPrompt: prompt,
+        syncedNewMessages: req.syncLatestFirst ? 1 : 0,
+        totalMessages: 8,
+        launched: !req.prepareOnly,
+        warnings: [],
+      } as unknown as T;
+    }
+    case 'set_quick_launch_custom_path': {
+      const toolId = String(args?.toolId ?? '');
+      const customPath = (args?.customPath as string | null | undefined) ?? null;
+      const next = getMockQuickLaunchTools().map((tool) =>
+        tool.id === toolId
+          ? {
+              ...tool,
+              custom_path: customPath && customPath.trim() ? customPath.trim() : null,
+              available: Boolean((customPath && customPath.trim()) || tool.detected_path),
+            }
+          : tool,
+      );
+      mockQuickLaunchState = next;
+      return next as unknown as T;
+    }
     case 'get_app_paths':
       return {
         root: './data',
@@ -1124,4 +1405,144 @@ async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Promi
     default:
       return true as unknown as T;
   }
+}
+
+let mockQuickLaunchState: QuickLaunchTool[] | null = null;
+
+function getMockQuickLaunchTools(): QuickLaunchTool[] {
+  if (!mockQuickLaunchState) {
+    mockQuickLaunchState = [
+      {
+        id: 'codex_app',
+        name: 'Codex',
+        category: 'ai_app',
+        available: true,
+        running: true,
+        detected_path: 'shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App',
+        custom_path: null,
+        supports_folder: false,
+      },
+      {
+        id: 'claude_app',
+        name: 'Claude',
+        category: 'ai_app',
+        available: true,
+        running: false,
+        detected_path: 'shell:AppsFolder\\Claude_pzs8sxrjxfjjc!Claude',
+        custom_path: null,
+        supports_folder: false,
+      },
+      {
+        id: 'antigravity_app',
+        name: 'Antigravity',
+        category: 'ai_app',
+        available: true,
+        running: true,
+        detected_path: 'C:\\Users\\demo\\AppData\\Local\\Programs\\antigravity\\Antigravity.exe',
+        custom_path: null,
+        supports_folder: true,
+      },
+      {
+        id: 'codex_cli',
+        name: 'Codex CLI',
+        category: 'ai_cli',
+        available: true,
+        running: false,
+        detected_path: 'C:\\Users\\demo\\AppData\\Local\\OpenAI\\Codex\\bin\\codex.exe',
+        custom_path: null,
+        supports_folder: true,
+      },
+      {
+        id: 'claude_cli',
+        name: 'Claude Code',
+        category: 'ai_cli',
+        available: true,
+        running: false,
+        detected_path: 'C:\\Users\\demo\\.local\\bin\\claude.exe',
+        custom_path: null,
+        supports_folder: true,
+      },
+      {
+        id: 'antigravity_cli',
+        name: 'Antigravity CLI',
+        category: 'ai_cli',
+        available: true,
+        running: false,
+        detected_path: 'C:\\Users\\demo\\AppData\\Local\\agy\\bin\\agy.exe',
+        custom_path: null,
+        supports_folder: true,
+      },
+      {
+        id: 'vscode',
+        name: 'VS Code',
+        category: 'editor',
+        available: true,
+        running: true,
+        detected_path: 'C:\\Users\\demo\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe',
+        custom_path: null,
+        supports_folder: true,
+      },
+      {
+        id: 'cursor',
+        name: 'Cursor',
+        category: 'editor',
+        available: false,
+        running: false,
+        detected_path: null,
+        custom_path: null,
+        supports_folder: true,
+      },
+      {
+        id: 'windsurf',
+        name: 'Windsurf',
+        category: 'editor',
+        available: false,
+        running: false,
+        detected_path: null,
+        custom_path: null,
+        supports_folder: true,
+      },
+      {
+        id: 'trae',
+        name: 'Trae',
+        category: 'editor',
+        available: false,
+        running: false,
+        detected_path: null,
+        custom_path: null,
+        supports_folder: true,
+      },
+      {
+        id: 'windows_terminal',
+        name: 'Windows Terminal',
+        category: 'terminal',
+        available: true,
+        running: false,
+        detected_path: 'C:\\Users\\demo\\AppData\\Local\\Microsoft\\WindowsApps\\wt.exe',
+        custom_path: null,
+        supports_folder: true,
+      },
+      {
+        id: 'powershell',
+        name: 'PowerShell',
+        category: 'terminal',
+        available: true,
+        running: false,
+        detected_path: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+        custom_path: null,
+        supports_folder: true,
+      },
+      {
+        id: 'git_bash',
+        name: 'Git Bash',
+        category: 'terminal',
+        available: false,
+        running: false,
+        detected_path: null,
+        custom_path: null,
+        supports_folder: true,
+      },
+    ];
+  }
+  return mockQuickLaunchState;
 }

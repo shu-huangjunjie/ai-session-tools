@@ -164,7 +164,7 @@ pub async fn get_messages(
     let db = state.database.clone();
     run_blocking(move || {
         Repository::new(&db)
-            .load_active_path(&conversation_id)
+            .load_active_path_or_chronological(&conversation_id)
             .map_err(|e| e.to_string())
     })
     .await
@@ -188,4 +188,15 @@ pub async fn search_conversations(
             .map_err(|e| e.to_string())
     })
     .await
+}
+
+/// 跨工具/跨账号会话接力（模式 A 原生注入，或模式 B 生成精简交接包并拉起目标 CLI/客户端）。
+#[tauri::command]
+pub async fn handoff_conversation(
+    state: State<'_, AppState>,
+    request: crate::services::HandoffRequest,
+) -> Result<crate::services::HandoffResult, String> {
+    let paths = state.paths.clone();
+    let db = state.database.clone();
+    run_blocking(move || crate::services::execute_handoff(&paths, &db, request)).await
 }

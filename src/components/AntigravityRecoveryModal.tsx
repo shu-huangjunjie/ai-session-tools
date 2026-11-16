@@ -34,11 +34,13 @@ export const AntigravityRecoveryModal: React.FC<AntigravityRecoveryModalProps> =
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(new Set());
 
-  // Initialize selection when report arrives (defaults to selecting candidates not yet imported)
+  // Initialize selection when report arrives (defaults to new or updated candidates)
   React.useEffect(() => {
     if (report) {
       const initial = new Set(
-        report.candidates.filter((c) => !c.exists_locally).map((c) => c.conversation_id)
+        report.candidates
+          .filter((c) => !c.exists_locally || Boolean(c.has_updates))
+          .map((c) => c.conversation_id)
       );
       setSelectedIds(initial);
     }
@@ -48,7 +50,7 @@ export const AntigravityRecoveryModal: React.FC<AntigravityRecoveryModalProps> =
     if (!report) return [];
     let list = report.candidates;
     if (hideExisting) {
-      list = list.filter((c) => !c.exists_locally);
+      list = list.filter((c) => !c.exists_locally || Boolean(c.has_updates));
     }
     const q = filterText.trim().toLowerCase();
     if (q) {
@@ -247,10 +249,17 @@ export const AntigravityRecoveryModal: React.FC<AntigravityRecoveryModalProps> =
 
                             <div className="flex items-center gap-2 ml-2 flex-shrink-0">
                               {cand.exists_locally ? (
-                                <span className="flex items-center gap-1 text-[10px] text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20 font-medium">
-                                  <CheckCircle2 size={10} />
-                                  {t.modals.badgeIncremental}
-                                </span>
+                                cand.has_updates ? (
+                                  <span className="flex items-center gap-1 text-[10px] text-amber-600 dark:text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded-full border border-amber-500/25 font-medium">
+                                    <RefreshCw size={10} />
+                                    {t.modals.badgeHasUpdates}
+                                  </span>
+                                ) : (
+                                  <span className="flex items-center gap-1 text-[10px] text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20 font-medium">
+                                    <CheckCircle2 size={10} />
+                                    {t.modals.badgeUpToDate}
+                                  </span>
+                                )
                               ) : (
                                 <span className="text-[10px] text-[#0071e3] dark:text-[#2997ff] bg-[#0071e3]/10 px-2 py-0.5 rounded-full border border-[#0071e3]/20 font-medium">
                                   {t.modals.badgeNotImported}

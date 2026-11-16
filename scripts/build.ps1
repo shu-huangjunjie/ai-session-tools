@@ -10,8 +10,16 @@ param(
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# Refresh PATH from registry so newly installed Node/Rust are immediately available
-$env:Path = [System.Environment]::GetEnvironmentVariable("Path","User") + ";" + [System.Environment]::GetEnvironmentVariable("Path","Machine")
+# Refresh PATH from registry + local portable toolchains so Node/Rust are immediately available
+$userPath = [System.Environment]::GetEnvironmentVariable("Path","User")
+$sysPath = [System.Environment]::GetEnvironmentVariable("Path","Machine")
+$extraPaths = @(
+    "D:\huangjunjie\.env\web_node",
+    "C:\Program Files\nodejs",
+    "$env:LOCALAPPDATA\Programs\nodejs",
+    "$env:USERPROFILE\.cargo\bin"
+)
+$env:Path = "$($extraPaths -join ';');$userPath;$sysPath;$env:Path"
 
 Write-Host "=================================================" -ForegroundColor Cyan
 Write-Host " Context Vault (TS + Rust) 便携程序构建脚本" -ForegroundColor Cyan
@@ -35,6 +43,9 @@ if ($LASTEXITCODE -ne 0) { throw "Frontend build failed with exit code $LASTEXIT
 # 3. Build Tauri binary
 Write-Host "[3/3] 正在编译 Rust 后端与打包便携程序..." -ForegroundColor Yellow
 Set-Location "$ProjectRoot\src-tauri"
+if (Test-Path "$ProjectRoot\src-tauri\build.rs") {
+    (Get-Item "$ProjectRoot\src-tauri\build.rs").LastWriteTime = Get-Date
+}
 $CargoTargetDir = if ($env:CARGO_TARGET_DIR) {
     [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
 } else {
@@ -75,6 +86,8 @@ New-Item -ItemType Directory -Force -Path $DesktopOutDir | Out-Null
 $ReleaseExe = Join-Path $CargoTargetDir 'release\context-vault.exe'
 
 if (Test-Path $ReleaseExe) {
+    Get-Process -Name "Context-Vault", "context-vault" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 300
     Copy-Item $ReleaseExe -Destination (Join-Path $OutDir "Context-Vault.exe") -Force
     Copy-Item $ReleaseExe -Destination (Join-Path $DesktopOutDir "Context-Vault.exe") -Force
     foreach ($dir in @($OutDir, $DesktopOutDir)) {

@@ -22,12 +22,12 @@ export const Switch: React.FC<SwitchProps> = ({ checked, onChange, label, title,
       e.stopPropagation();
       onChange(!checked);
     }}
-    className={`relative inline-flex h-5 w-[34px] flex-shrink-0 items-center rounded-full transition-colors duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#0071e3]/40 disabled:opacity-40 disabled:cursor-not-allowed ${
-      checked ? 'bg-[#34c759]' : 'bg-black/[0.14] dark:bg-white/[0.2]'
+    className={`relative inline-flex h-5 w-[34px] flex-shrink-0 items-center rounded-full transition-colors duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40 disabled:opacity-40 disabled:cursor-not-allowed ${
+      checked ? 'bg-blue-600 dark:bg-blue-500' : 'bg-slate-200 dark:bg-slate-700'
     }`}
   >
     <span
-      className={`inline-block h-4 w-4 rounded-full bg-white shadow-[0_1px_2px_rgba(0,0,0,0.25)] transition-transform duration-150 ${
+      className={`inline-block h-4 w-4 rounded-full bg-white shadow-[0_1px_2px_rgba(15,23,42,0.22)] transition-transform duration-150 ${
         checked ? 'translate-x-[16px]' : 'translate-x-[2px]'
       }`}
     />
